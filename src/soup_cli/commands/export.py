@@ -1077,7 +1077,7 @@ def _export_gptq(
     if cal_path is None:
         console.print(
             "[red]GPTQ export requires --calibration-data.[/]\n"
-            "Unlike --format awq, auto-gptq has no built-in fallback dataset: "
+            "auto-gptq has no built-in calibration dataset: "
             "pass a calibration JSONL, e.g. [bold]--calibration-data path/to/data.jsonl[/]."
         )
         raise typer.Exit(1)
