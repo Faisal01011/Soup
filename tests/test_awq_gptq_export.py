@@ -1,6 +1,7 @@
 """Tests for AWQ and GPTQ export — config, validation, CLI."""
 
 import builtins
+import re
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -10,6 +11,18 @@ import pytest
 from click.exceptions import Exit as ClickExit
 
 from soup_cli.commands.export import SUPPORTED_FORMATS
+
+# Rich colours per character on a colour-capable runner and WRAPS at the
+# terminal width, drawing box borders between the fragments of a wrapped help
+# line. Strip ANSI escapes and box-drawing characters, then collapse
+# whitespace, before any substring match on CLI output.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_BOX_RE = re.compile(r"[\u2500-\u257f]")
+
+
+def _plain(text: str) -> str:
+    """ANSI- and border-stripped, whitespace-collapsed CLI output."""
+    return " ".join(_BOX_RE.sub(" ", _ANSI_RE.sub("", text)).split())
 
 
 def _mock_import(awq_mock=None, gptq_mock=None):
@@ -91,14 +104,21 @@ class TestAwqExportCLI:
         assert "gptq" in result.output.lower()
 
     def test_calibration_help_names_both_required_formats(self):
-        """The shared option must not imply AWQ can omit calibration data."""
-        from typer.testing import CliRunner
+        """The shared option must not imply AWQ can omit calibration data.
+
+        Asserted on the Click parameter rather than on rendered ``--help``:
+        Rich wraps prose inside its box borders at any terminal width, so a
+        substring match on the rendered text breaks on an unrelated width or
+        help-string change.
+        """
+        import typer
 
         from soup_cli.cli import app
 
-        result = CliRunner().invoke(app, ["export", "--help"])
+        cmd = typer.main.get_command(app).commands["export"]
+        param = next(p for p in cmd.params if "--calibration-data" in p.opts)
 
-        assert "Required for AWQ and GPTQ" in result.output
+        assert param.help == "Path to calibration JSONL. Required for AWQ and GPTQ."
 
 
 # ─── GPTQ Export CLI Tests ────────────────────────────────────────────────
@@ -170,7 +190,7 @@ class TestAwqExportFunction:
                     model_dir, None, None, bits=4, group_size=128,
                     calibration_data=None,
                 )
-        output = capsys.readouterr().out
+        output = _plain(capsys.readouterr().out)
         assert "AWQ export requires --calibration-data" in output
         assert "default calibration dataset" in output
 
@@ -261,7 +281,8 @@ class TestAwqExportFunction:
                         calibration_data=str(cal_file),
                     )
 
-        assert "not valid UTF-8" in capsys.readouterr().out
+        # Rich's highlighter colours the "8" in "UTF-8" as a number.
+        assert "not valid UTF-8" in _plain(capsys.readouterr().out)
 
     def test_export_awq_rejects_unreadable_calibration_before_import(self, tmp_path, capsys):
         model_dir = tmp_path / "model"
