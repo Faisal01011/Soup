@@ -82,8 +82,15 @@ def validate(
         "auto", "--format", "-f",
         help="Expected format: auto, alpaca, sharegpt, chatml, dpo, kto, plaintext",
     ),
+    min_valid_fraction: float = typer.Option(
+        0.0,
+        "--min-valid-fraction",
+        min=0.0,
+        max=1.0,
+        help="Exit 2 when the fraction of valid rows is below this value",
+    ),
 ):
-    """Validate dataset format and report issues."""
+    """Validate a dataset, returning exit 1 for input errors and 2 for unusable data."""
     file_path = Path(path)
     if not file_path.exists():
         console.print(f"[red]File not found: {file_path}[/]")
@@ -114,6 +121,17 @@ def validate(
     valid = result["valid_rows"]
     total = result["total"]
     console.print(f"\n[green]{valid}/{total} rows valid for {fmt} format[/]")
+
+    if total > 0 and valid == 0:
+        console.print("[red]Validation failed: no usable rows remain.[/]")
+        raise typer.Exit(2)
+
+    if total > 0 and valid / total < min_valid_fraction:
+        console.print(
+            f"[red]Validation failed: valid fraction {valid / total:.3f} is below "
+            f"--min-valid-fraction {min_valid_fraction:.3f}.[/]"
+        )
+        raise typer.Exit(2)
 
 
 @app.command()
@@ -3035,10 +3053,12 @@ def best_of_n(
         "", "--emit-pairs", help="Also write winner/loser DPO pairs to this JSONL"
     ),
     checkpoint: str = typer.Option(
-        "", "--checkpoint", help="Recovery journal (default: <output>.checkpoint.jsonl)"
+        "",
+        "--checkpoint",
+        help="Recovery journal (default: <output-or-artifact>.checkpoint.jsonl)",
     ),
     manifest: str = typer.Option(
-        "", "--manifest", help="Final consistency manifest (default: <output>.manifest.json)"
+        "", "--manifest", help="Commit manifest (default: <output>.manifest.json)"
     ),
     resume: bool = typer.Option(False, "--resume", help="Resume a matching checkpoint"),
     export_candidates: str = typer.Option(
@@ -3077,11 +3097,7 @@ def best_of_n(
     from soup_cli.utils import best_of_n_artifact as bon_artifact
     from soup_cli.utils import best_of_n_checkpoint as bon_checkpoint
     from soup_cli.utils.magpie import make_magpie_generate_fn
-    from soup_cli.utils.paths import (
-        atomic_write_bytes,
-        atomic_write_bytes_group,
-        enforce_under_cwd_and_no_symlink,
-    )
+    from soup_cli.utils.paths import enforce_under_cwd_and_no_symlink
     from soup_cli.utils.trust_remote import (
         model_requires_trust_remote_code,
         resolve_trust_remote_code,
@@ -3104,8 +3120,16 @@ def best_of_n(
         console.print("[red]offline materialization and --export-candidates are exclusive[/]")
         raise typer.Exit(2)
     if offline_mode:
+        from soup_cli.utils import best_of_n_stream as bon_stream
+
         if not candidate_artifact or not judgments:
             console.print("[red]provide both --candidate-artifact and --judgments[/]")
+            raise typer.Exit(2)
+        if resume or checkpoint:
+            console.print(
+                "[red]offline materialization does not support --resume or --checkpoint; "
+                "rerun with the same candidate and judgment artifacts[/]"
+            )
             raise typer.Exit(2)
         if any(
             (
@@ -3119,6 +3143,8 @@ def best_of_n(
                 revision,
                 trust_remote_code,
                 seed != 0,
+                checkpoint,
+                resume,
                 n != 8,
                 temperature != 1.0,
                 max_new_tokens != 256,
@@ -3131,6 +3157,7 @@ def best_of_n(
         if not output and not plan_only:
             console.print("[red]--output is required unless --plan-only is set.[/]")
             raise typer.Exit(2)
+        manifest_path = manifest or (f"{output}.manifest.json" if output else "")
         try:
             paths = [candidate_artifact, judgments]
             if output:
@@ -3139,69 +3166,90 @@ def best_of_n(
             if emit_pairs:
                 enforce_under_cwd_and_no_symlink(emit_pairs, "--emit-pairs path")
                 paths.append(emit_pairs)
+            if manifest_path:
+                enforce_under_cwd_and_no_symlink(manifest_path, "--manifest path")
+                paths.append(manifest_path)
             if len({os.path.normcase(os.path.realpath(path)) for path in paths}) != len(paths):
                 raise ValueError("offline input and output paths must be distinct")
-            groups, sampler_spec, candidate_sha = bon_artifact.load_candidate_artifact(
-                candidate_artifact
-            )
-            verified, judgments_sha = bon_artifact.load_judgments(judgments, groups)
-            sft_rows, dpo_rows = bon_artifact.materialize_rows(
-                groups,
-                verified,
-                sampler=sampler_spec,
-                candidate_artifact_sha256=candidate_sha,
-                judgments_sha256=judgments_sha,
-            )
         except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
             console.print(f"[red]Invalid offline artifact: {_escape(str(exc))}[/]")
             raise typer.Exit(2) from exc
-        console.print(
-            Panel(
-                f"Candidate groups: [bold]{len(groups)}[/]\n"
-                f"Verified rows:    [bold]{len(verified)}[/]\n"
-                "Network/model:    [bold]disabled[/]",
-                title="soup data best-of-n — offline plan",
-            )
-        )
-        if plan_only:
-            return
+        publication_started = False
         try:
-            publication = [
-                (
-                    bon_artifact.stable_jsonl(sft_rows).encode("utf-8"),
-                    output,
-                    "output",
-                )
-            ]
-            if emit_pairs:
-                publication.append(
-                    (
-                        bon_artifact.stable_jsonl(dpo_rows).encode("utf-8"),
-                        emit_pairs,
-                        "emit-pairs",
+            with bon_stream.index_offline_artifacts(
+                candidate_artifact, judgments
+            ) as offline_index:
+                console.print(
+                    Panel(
+                        f"Candidate groups: [bold]{offline_index.group_count}[/]\n"
+                        f"Matched rows:     [bold]{offline_index.group_count}[/]\n"
+                        "Network/model:    [bold]disabled[/]",
+                        title="soup data best-of-n — offline plan",
                     )
                 )
-            atomic_write_bytes_group(publication)
-        except (OSError, TypeError, ValueError) as exc:
+                if plan_only:
+                    offline_index.validate_all()
+                    return
+                staged = bon_stream.stage_offline_datasets(
+                    offline_index, output, emit_pairs
+                )
+                if staged.sft_count != offline_index.group_count:
+                    staged.cleanup()
+                    raise ValueError(
+                        "judgments must cover every candidate group exactly once"
+                    )
+                publication_started = True
+                try:
+                    stale_dpo = ""
+                    if not emit_pairs and os.path.lexists(manifest_path):
+                        stale_dpo = bon_artifact.find_committed_sibling_dpo(
+                            manifest_path, sft_path=output
+                        )
+                    manifest_bytes = bon_artifact.offline_manifest_from_digests(
+                        candidate_artifact_sha256=offline_index.candidate_sha256,
+                        judgments_sha256=offline_index.judgments_sha256,
+                        sft_path=output,
+                        sft_sha256=staged.sft_sha256,
+                        sft_count=staged.sft_count,
+                        dpo_path=emit_pairs,
+                        dpo_sha256=staged.dpo_sha256,
+                        dpo_count=staged.dpo_count,
+                    ).encode("utf-8")
+                    bon_stream.publish_staged_datasets(
+                        staged,
+                        output,
+                        emit_pairs,
+                        manifest_path=manifest_path,
+                        manifest_bytes=manifest_bytes,
+                        stale_dpo_path=stale_dpo,
+                    )
+                finally:
+                    staged.cleanup()
+                sft_count = staged.sft_count
+                dpo_count = staged.dpo_count
+        except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+            if not publication_started:
+                console.print(f"[red]Invalid offline artifact: {_escape(str(exc))}[/]")
+                raise typer.Exit(2) from exc
             console.print(f"[red]Failed to write output: {_escape(str(exc))}[/]")
             raise typer.Exit(1) from exc
         body = (
-            f"SFT rows:   [bold]{len(sft_rows)}[/]\n"
+            f"SFT rows:   [bold]{sft_count}[/]\n"
             f"Output:     [bold]{_escape(os.path.relpath(output))}[/]"
         )
         if emit_pairs:
             body += (
-                f"\nDPO pairs:  [bold]{len(dpo_rows)}[/]\n"
+                f"\nDPO pairs:  [bold]{dpo_count}[/]\n"
                 f"Pairs out:  [bold]{_escape(os.path.relpath(emit_pairs))}[/]"
             )
+        body += f"\nManifest:   [bold]{_escape(os.path.relpath(manifest_path))}[/]"
         console.print(Panel(body, title="soup data best-of-n — offline done"))
         return
 
     if export_mode:
-        if judge or output or emit_pairs or checkpoint or manifest or resume:
+        if judge or output or emit_pairs or manifest:
             console.print(
-                "[red]--export-candidates cannot be combined with judge, final-output, "
-                "or online-recovery options[/]"
+                "[red]--export-candidates cannot be combined with judge or final outputs[/]"
             )
             raise typer.Exit(2)
     elif not judge:
@@ -3247,6 +3295,16 @@ def best_of_n(
             enforce_under_cwd_and_no_symlink(
                 export_candidates, "--export-candidates path"
             )
+            checkpoint_path = checkpoint or f"{export_candidates}.checkpoint.jsonl"
+            enforce_under_cwd_and_no_symlink(checkpoint_path, "--checkpoint path")
+            export_paths = [prompts, export_candidates, checkpoint_path]
+            if len(
+                {os.path.normcase(os.path.realpath(path)) for path in export_paths}
+            ) != len(export_paths):
+                raise ValueError(
+                    "prompt source, candidate artifact, and checkpoint paths "
+                    "must be distinct"
+                )
     except (FileNotFoundError, TypeError, ValueError) as exc:
         console.print(f"[red]{_escape(str(exc))}[/]")
         raise typer.Exit(2) from exc
@@ -3254,7 +3312,7 @@ def best_of_n(
         console.print("[red]--prompts produced no usable rows[/]")
         raise typer.Exit(2)
     prompt_list = [prompt for prompt, _source_line in prompt_records]
-    if resume and not output:
+    if resume and not export_mode and not output:
         console.print("[red]--resume requires --output[/]")
         raise typer.Exit(2)
 
@@ -3309,6 +3367,10 @@ def best_of_n(
 
     sampler_label = f"{sampling_provider}:{model}" if generate_fn is not None else base
     if generate_fn is not None:
+        default_endpoint = {
+            "ollama": "http://localhost:11434",
+            "vllm": "http://localhost:8000",
+        }[sampling_provider]
         sampler_spec = {
             "kind": "provider",
             "provider": sampling_provider,
@@ -3317,9 +3379,22 @@ def best_of_n(
             "temperature": temperature,
             "max_new_tokens": max_new_tokens,
         }
+        sampler_identity = bon_artifact.sampler_identity_fingerprint(
+            "provider-endpoint", base_url or default_endpoint
+        )
     else:
         is_local_path = os.path.exists(base) or os.path.isabs(base) or ntpath.isabs(base)
         public_model = "<local-model>" if is_local_path else base
+        model_identity = os.path.realpath(base) if is_local_path else base
+        model_fingerprint_parts = [
+            "local-model",
+            model_identity,
+            revision or "unspecified",
+        ]
+        if is_local_path and export_mode:
+            model_fingerprint_parts.append(
+                bon_artifact.local_model_content_fingerprint(base)
+            )
         sampler_spec = {
             "kind": "local",
             "model": public_model,
@@ -3331,6 +3406,9 @@ def best_of_n(
             "seed": seed,
             "trust_remote_code": trust,
         }
+        sampler_identity = bon_artifact.sampler_identity_fingerprint(
+            *model_fingerprint_parts
+        )
 
     digest = ""
     if not export_mode:
@@ -3345,6 +3423,7 @@ def best_of_n(
                 "temperature": temperature,
                 "max_new_tokens": max_new_tokens,
                 "device": device,
+                "revision": revision,
                 "seed": seed,
                 "trust_remote_code": trust,
                 "judge": judge,
@@ -3369,53 +3448,37 @@ def best_of_n(
         console.print("[red]--output is required unless --plan-only is set.[/]")
         raise typer.Exit(2)
 
-    completed_entries = []
-    if not export_mode:
-        try:
-            targets = [output, checkpoint_path, manifest_path]
-            if emit_pairs:
-                targets.append(emit_pairs)
-            if len({os.path.normcase(os.path.realpath(path)) for path in targets}) != len(
-                targets
-            ):
-                raise ValueError(
-                    "output, pairs, checkpoint, and manifest paths must be distinct"
-                )
-            if resume:
-                completed_entries = bon_checkpoint.load_checkpoint(
-                    checkpoint_path, digest=digest, total=len(prompt_list)
-                )
-            else:
-                bon_checkpoint.initialise_checkpoint(
-                    checkpoint_path, digest=digest, total=len(prompt_list)
-                )
-        except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
-            console.print(f"[red]Invalid checkpoint: {_escape(str(exc))}[/]")
-            raise typer.Exit(2) from exc
-
-    local_model = None
-    tokenizer = None
-    local_torch = None
-    if generate_fn is None and (
-        export_mode or len(completed_entries) < len(prompt_list)
-    ):
-        import torch
-
-        local_torch = torch
-        if export_mode:
-            torch.manual_seed(seed)
-        if revision:
-            local_model, tokenizer = _load_bon_model(
-                base, device, trust, revision=revision
-            )
-        else:
-            local_model, tokenizer = _load_bon_model(base, device, trust)
-
     dev = device or None
     if export_mode:
-        groups = []
+        from soup_cli.utils import best_of_n_stream as bon_stream
+
+        checkpoint_path = checkpoint or f"{export_candidates}.checkpoint.jsonl"
+        completed = 0
         try:
-            for index, (prompt, source_line) in enumerate(prompt_records):
+            completed = bon_stream.prepare_candidate_checkpoint(
+                checkpoint_path,
+                prompt_records,
+                sampler_spec,
+                sampler_identity,
+                resume=resume,
+            )
+            local_model = None
+            tokenizer = None
+            local_torch = None
+            if generate_fn is None and completed < len(prompt_list):
+                import torch
+
+                local_torch = torch
+                if revision:
+                    local_model, tokenizer = _load_bon_model(
+                        base, device, trust, revision=revision
+                    )
+                else:
+                    local_model, tokenizer = _load_bon_model(base, device, trust)
+            for index in range(completed, len(prompt_records)):
+                prompt, source_line = prompt_records[index]
+                if local_torch is not None:
+                    local_torch.manual_seed(bon_checkpoint.prompt_seed(seed, index))
                 candidates = bon.sample_candidates(
                     local_model,
                     tokenizer,
@@ -3426,33 +3489,77 @@ def best_of_n(
                     device=dev,
                     generate_fn=generate_fn,
                 )
-                groups.append(
-                    bon_artifact.build_candidate_group(
-                        prompt,
-                        index,
-                        candidates,
-                        sampler_spec,
-                        source_line=source_line,
-                    )
+                group = bon_artifact.build_candidate_group(
+                    prompt,
+                    index,
+                    candidates,
+                    sampler_spec,
+                    source_line=source_line,
                 )
-            atomic_write_bytes(
-                bon_artifact.candidate_artifact_text(groups, sampler_spec).encode(
-                    "utf-8"
-                ),
+                bon_stream.append_candidate_group(checkpoint_path, group)
+                completed = index + 1
+            bon_stream.publish_candidate_checkpoint(
+                checkpoint_path,
                 export_candidates,
-                field="export-candidates",
+                prompt_records,
+                sampler_spec,
+                sampler_identity,
             )
         except Exception as exc:
-            console.print("[red]Candidate export failed before publication.[/]")
+            console.print(
+                "[red]Candidate export failed before publication.[/]\n"
+                f"Reason:           [bold]{_escape(str(exc))}[/]\n"
+                f"Completed groups: [bold]{completed}/{len(prompt_list)}[/]\n"
+                f"Resume with: [bold]--resume --checkpoint "
+                f"{_escape(os.path.relpath(checkpoint_path))}[/]"
+            )
             raise typer.Exit(1) from exc
         console.print(
             Panel(
-                f"Candidate groups: [bold]{len(groups)}[/]\n"
-                f"Output:           [bold]{_escape(os.path.relpath(export_candidates))}[/]",
+                f"Candidate groups: [bold]{completed}[/]\n"
+                f"Output:           [bold]{_escape(os.path.relpath(export_candidates))}[/]\n"
+                f"Checkpoint:       [bold]{_escape(os.path.relpath(checkpoint_path))}[/]",
                 title="soup data best-of-n — candidates exported",
             )
         )
         return
+
+    completed_entries = []
+    try:
+        targets = [output, checkpoint_path, manifest_path]
+        if emit_pairs:
+            targets.append(emit_pairs)
+        if len({os.path.normcase(os.path.realpath(path)) for path in targets}) != len(
+            targets
+        ):
+            raise ValueError(
+                "output, pairs, checkpoint, and manifest paths must be distinct"
+            )
+        if resume:
+            completed_entries = bon_checkpoint.load_checkpoint(
+                checkpoint_path, digest=digest, total=len(prompt_list)
+            )
+        else:
+            bon_checkpoint.initialise_checkpoint(
+                checkpoint_path, digest=digest, total=len(prompt_list)
+            )
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        console.print(f"[red]Invalid checkpoint: {_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+    local_model = None
+    tokenizer = None
+    local_torch = None
+    if generate_fn is None and len(completed_entries) < len(prompt_list):
+        import torch
+
+        local_torch = torch
+        if revision:
+            local_model, tokenizer = _load_bon_model(
+                base, device, trust, revision=revision
+            )
+        else:
+            local_model, tokenizer = _load_bon_model(base, device, trust)
 
     sft_rows = [entry[0] for entry in completed_entries]
     pair_rows = [entry[1] for entry in completed_entries if entry[1] is not None]

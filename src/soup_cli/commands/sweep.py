@@ -81,6 +81,32 @@ def sweep(
     # Generate parameter combinations
     combinations = _generate_combinations(sweep_params, strategy, max_runs)
 
+    # Validate before anything is printed (#642). --dry-run used to return
+    # below without ever loading the config, so neither the loader's
+    # unknown-key warning (#627) nor the sweep-parameter pre-flight (#628)
+    # was reachable under it — a dry run whose job is catching mistakes
+    # before a long run caught neither. Loading a config file executes
+    # nothing, so both paths now validate at the same point and share the
+    # single load.
+    base_cfg = load_config(config_path)
+
+    # Refuse the whole sweep before any arm starts — and before printing a
+    # grid that can never run (#627, #642). The arm loop below wraps each run
+    # in `except Exception`, so the guard inside `_run_single` would be
+    # caught, recorded as a per-arm failure, and the command would still
+    # exit 0 — an entirely invalid sweep that nothing downstream can detect.
+    # Every combination carries the same parameter names, so one probe built
+    # the way `_run_single` builds its config settles it for the grid.
+    if combinations:
+        probe = base_cfg.model_dump()
+        for key, val in combinations[0].items():
+            _set_nested_param(probe, key, val)
+        try:
+            _reject_unknown_sweep_params(probe)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(1) from exc
+
     console.print(
         Panel(
             f"Config:   [bold]{config_path}[/]\n"
@@ -112,8 +138,6 @@ def sweep(
             console.print("[yellow]Cancelled.[/]")
             raise typer.Exit()
 
-    # Execute sweep
-    base_cfg = load_config(config_path)
     results = []
     best_loss = float("inf")
     skipped = 0
@@ -328,15 +352,29 @@ def _set_nested_param(config_dict: dict, key: str, value) -> dict:
     return config_dict
 
 
+def _reject_unknown_sweep_params(config_dict: dict) -> None:
+    """Refuse a sweep whose parameter names no config field (#627).
+
+    ``config_dict`` starts from a validated ``model_dump()``, so anything the
+    schema cannot place got there from a ``--param`` name. Dropping it silently
+    would run the whole grid with the swept knob never applied, producing arms
+    that are all identical and a winner that means nothing -- so this raises
+    regardless of the loader's severity switch, and carries no deadline: there
+    is no partially-useful result to preserve by continuing.
+
+    Kept out of :func:`_run_single` so it is reachable without importing the
+    training stack, and so removing it fails a test rather than a review.
+    """
+    from soup_cli.config.unknown_keys import find_unknown_config_keys, format_unknown_keys
+
+    unknown = find_unknown_config_keys(config_dict)
+    if unknown:
+        detail = format_unknown_keys(unknown, include_deadline=False)
+        raise ValueError(f"sweep parameter does not match any config field: {detail}")
+
+
 def _run_single(base_cfg, params: dict, run_name: str, config_path: Path) -> dict:
     """Run a single training with modified parameters."""
-    from soup_cli.config.schema import SoupConfig
-    from soup_cli.data.loader import load_dataset
-    from soup_cli.experiment.tracker import ExperimentTracker
-    from soup_cli.monitoring.display import TrainingDisplay
-    from soup_cli.trainer.sft import SFTTrainerWrapper
-    from soup_cli.utils.gpu import detect_device, get_gpu_info
-
     # Deep copy and modify config
     config_dict = base_cfg.model_dump()
     for key, val in params.items():
@@ -344,6 +382,19 @@ def _run_single(base_cfg, params: dict, run_name: str, config_path: Path) -> dic
 
     # Override experiment name
     config_dict["experiment_name"] = run_name
+
+    # Before the heavy imports, so this refusal is reachable -- and testable --
+    # without the training stack. `sweep()` pre-checks the grid too; this stays
+    # so a direct caller cannot bypass it.
+    _reject_unknown_sweep_params(config_dict)
+
+    from soup_cli.config.schema import SoupConfig
+    from soup_cli.data.loader import load_dataset
+    from soup_cli.experiment.tracker import ExperimentTracker
+    from soup_cli.monitoring.display import TrainingDisplay
+    from soup_cli.trainer.sft import SFTTrainerWrapper
+    from soup_cli.utils.gpu import detect_device, get_gpu_info
+
     cfg = SoupConfig(**config_dict)
 
     # Detect hardware

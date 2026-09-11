@@ -13,6 +13,8 @@ import pathlib
 
 import pytest
 
+from soup_cli.utils import layer_stream, layer_stream_runtime
+
 pytestmark = pytest.mark.filterwarnings("ignore::UserWarning")
 
 
@@ -52,6 +54,30 @@ MEASURED_VRAM_GRID = [
     dict(label="Qwen2.5-0.5B B8 S512", batch=8, seq=512, peak=9266992640, **_QWEN),
 ]
 
+# ---------------------------------------------------------------------------
+# #395 — the SECOND stack. Deliberately NOT part of MEASURED_VRAM_GRID above:
+# that grid carries a <1% accuracy claim fitted on the RTX 3050 / Windows /
+# torch 2.5.1 / transformers 4.57.6 box, and these rows are ~16% off it. Merging
+# them would destroy a real claim rather than widen it.
+#
+# What they DO carry is the direction property at sequence lengths the first
+# grid never reached, which is the hole #395 names. Measured on an A10G 23 GB /
+# Ubuntu 22.04 / torch 2.13.0+cu130 / transformers 5.16.1 / trl 0.29.1, real
+# `soup train` setup + one step, bf16, batch 1, quantization none, LoRA r=8.
+# Full record: benchmarks/gate-395-second-stack-vram.md
+SECOND_STACK_VRAM_GRID = [
+    dict(label="A10G SmolLM2-135M B1 S2048", batch=1, seq=2048, peak=1365200000, **_SMOL),
+    dict(label="A10G SmolLM2-135M B1 S3072", batch=1, seq=3072, peak=2016700000, **_SMOL),
+    dict(label="A10G SmolLM2-135M B1 S4096", batch=1, seq=4096, peak=2657800000, **_SMOL),
+    dict(label="A10G SmolLM2-135M B1 S4352", batch=1, seq=4352, peak=2818400000, **_SMOL),
+    dict(label="A10G SmolLM2-135M B1 S5120", batch=1, seq=5120, peak=3303000000, **_SMOL),
+    dict(label="A10G SmolLM2-135M B1 S6144", batch=1, seq=6144, peak=3943000000, **_SMOL),
+    dict(label="A10G Qwen2.5-0.5B B1 S2048", batch=1, seq=2048, peak=4177000000, **_QWEN),
+    dict(label="A10G Qwen2.5-0.5B B1 S4096", batch=1, seq=4096, peak=8012300000, **_QWEN),
+    dict(label="A10G Qwen2.5-0.5B B1 S5120", batch=1, seq=5120, peak=9929400000, **_QWEN),
+    dict(label="A10G Qwen2.5-0.5B B1 S6144", batch=1, seq=6144, peak=11848100000, **_QWEN),
+]
+
 # Accounting control for #324. This is deliberately separate from the measured
 # accuracy grid above: its peak is the first real row plus one additive
 # vocabulary slot, so it guards composition without pretending to be another
@@ -80,6 +106,100 @@ def _predict(row):
         batch_size=row["batch"],
         large_layer_bytes=row.get("large_layer_bytes", 0),
     )
+
+
+class TestSecondStackDirectionProperty:
+    """#395 — the direction property at seq 2048..6144, on a second GPU/stack.
+
+    The first grid's evidence stops at seq 512, which is the hole #395 names.
+    These rows extend the sequence axis by a factor of 12 on two models whose
+    vocabularies differ 3.1x, and they are the only evidence in this file taken
+    on hardware other than the RTX 3050.
+
+    They assert DIRECTION, not accuracy. The formula over-predicts by ~16% here
+    (see test_second_stack_gap_is_the_logits_term_alone for why that is one
+    named term rather than drift), so folding them into the <1% accuracy grid
+    would break a claim that is true on the stack it was fitted to.
+    """
+
+    @pytest.mark.parametrize(
+        "row", SECOND_STACK_VRAM_GRID, ids=lambda r: r["label"]
+    )
+    def test_never_under_predicts_on_the_second_stack(self, row):
+        assert _predict(row) >= row["peak"], row["label"]
+
+    @pytest.mark.parametrize(
+        "row", SECOND_STACK_VRAM_GRID, ids=lambda r: r["label"]
+    )
+    def test_sequence_axis_is_actually_exercised(self, row):
+        """The rows are only worth anything if they are past the first grid's
+        ceiling — a regression that quietly shortened them would leave this file
+        asserting the same seq<=512 regime twice."""
+        assert row["seq"] >= 2048
+
+    def test_second_stack_has_no_retained_logits_copy(self):
+        """The #395 finding, stated as the arithmetic that forces it.
+
+        The shipped 14 is ``LOGITS_LOSS_BYTES_PER_ELEMENT`` (12, measured at
+        12.000000 with zero spread on this stack too) plus 2 for one further
+        bf16 logits-shaped tensor whose retention #327 has not explained.
+
+        If that copy were retained on the A10G, the whole real peak would have
+        to exceed the logits term at 14 alone. On every row it does not, which
+        leaves no room for the non-logits terms let alone the copy. That is a
+        constraint on any explanation of #327's retention, and it is why this
+        grid over-predicts rather than under-predicting.
+
+        An earlier revision asserted a back-solved 11.83 B/element here. That
+        was withdrawn: it attributed the whole discrepancy to the logits
+        multiplier, when the multiplier is pinned at 12 on both stacks and the
+        gap is the absent copy plus a ~15% over-estimate of the non-logits
+        terms (benchmarks/gate-395-second-stack-vram.md).
+        """
+        from soup_cli.utils.layer_stream import (
+            LOGITS_BYTES_PER_ELEMENT,
+            estimate_logits_bytes,
+        )
+
+        for row in SECOND_STACK_VRAM_GRID:
+            logits_at_shipped = estimate_logits_bytes(
+                vocab_size=row["vocab"], seq_len=row["seq"], batch_size=row["batch"]
+            )
+            assert logits_at_shipped > row["peak"], (
+                f"{row['label']}: the logits term at "
+                f"{LOGITS_BYTES_PER_ELEMENT} B/element is "
+                f"{logits_at_shipped} but the whole measured peak is "
+                f"{row['peak']} - the retained bf16 copy would fit, so this "
+                f"row no longer supports the finding"
+            )
+
+    def test_the_non_logits_over_estimate_is_flat(self):
+        """Holding the MEASURED 12 fixed, the residual is a fixed fraction.
+
+        Flat across a 3.1x vocabulary contrast and a 3x sequence range argues
+        for a fixed-fraction over-estimate rather than a term that grows with
+        either. If this spread widened, the decomposition in the record would
+        no longer hold.
+        """
+        from soup_cli.utils.layer_stream import (
+            LOGITS_LOSS_BYTES_PER_ELEMENT,
+            estimate_logits_bytes,
+        )
+
+        ratios = []
+        for row in SECOND_STACK_VRAM_GRID:
+            elements = row["seq"] * row["vocab"] * row["batch"]
+            logits_at_shipped = estimate_logits_bytes(
+                vocab_size=row["vocab"], seq_len=row["seq"], batch_size=row["batch"]
+            )
+            non_logits_modelled = _predict(row) - logits_at_shipped
+            non_logits_true = row["peak"] - LOGITS_LOSS_BYTES_PER_ELEMENT * elements
+            assert non_logits_true > 0, row["label"]
+            ratios.append(non_logits_modelled / non_logits_true)
+
+        mean = sum(ratios) / len(ratios)
+        assert 1.10 < mean < 1.20, f"non-logits over-estimate moved: {mean}"
+        assert max(ratios) - min(ratios) < 0.10, f"no longer flat: {ratios}"
 
 
 class TestLogitsBytesIsMeasuredNotDerived:
@@ -170,10 +290,28 @@ class TestPeakVramReproducesTheMeasuredGrid:
         or 512. The grid varies BATCH (1..8), so this pins "never under-predicts
         as batch grows" and nothing about sequence length — a control only covers
         the variable it varies. Measured later on the same box, the property
-        fails as seq grows: 0.992x the real peak at seq 4096 and 0.830x at 5120,
-        deterministically. Read this as a bound on the regime below, not as the
-        global guarantee the phrase suggests; `training.stream_vram_probe`
-        exists because no fitted formula can carry that guarantee everywhere.
+        fails as seq grows: 0.934x the real peak at seq 5120 and 0.787x at 6144
+        — against the probe the same formula reads 0.992x at seq 4096 and
+        0.830x at 5120, because the probe runs 12.5-14.3% above the real step,
+        and the measurement is deterministic (repeats at a fixed shape return
+        bit-identical peaks, #395). Read this as a bound on the regime below,
+        not as the global guarantee the phrase suggests;
+        `training.stream_vram_probe` exists because no fitted formula can carry
+        that guarantee everywhere.
+
+        #395 KEPT this assertion rather than removing it, and that is forced
+        rather than preferred. Criteria 2 and 3 of #395 are jointly
+        unsatisfiable on this grid: criterion 3 asks to drop the seq<=512 scope,
+        but `test_never_under_predicts` is parametrized over a grid fitted on
+        the RTX 3050, and that stack demonstrably under-predicts at seq >= 5120
+        (the real-peak series above). Separating the grids is the only
+        construction that satisfies both. On the second stack — A10G / Linux /
+        torch 2.13 / transformers 5.16.1 — the property HOLDS to seq 6144
+        against real peaks, a flat 1.16x over-prediction
+        (SECOND_STACK_VRAM_GRID), same denominator as the 0.934x/0.787x series.
+        Two stacks disagreeing about one shape is the argument FOR pinning
+        scope per-grid: dropping the assertion because one stack is safe would
+        assert globally what neither stack can carry alone.
         """
         assert row["seq"] <= 512, (
             "this grid's evidence is seq<=512; a longer row added here would "
@@ -518,6 +656,7 @@ class TestMeasuredGemmCeiling:
         assert got.sm_clock_mhz is None or 100 <= got.sm_clock_mhz <= 4000
         # the shape is reported so a fraction-of-ceiling can be shape-matched
         assert got.size == 4096
+        assert got.dtype in {"float16", "bfloat16"}
 
     def test_the_reported_rate_matches_an_independently_timed_matmul(self):
         """The plausibility band above cannot be tight without pinning a
@@ -530,14 +669,17 @@ class TestMeasuredGemmCeiling:
         sessions at the same reported clock)."""
         import torch
 
+        from soup_cli.utils.layer_stream import resolve_stream_dtype
         from soup_cli.utils.layer_stream_runtime import _GEMM_SIZE, measure_gemm_tflops
 
         got = measure_gemm_tflops(device="cuda")
         assert got is not None
 
         size, iters = _GEMM_SIZE, 8
-        left = torch.randn(size, size, device="cuda", dtype=torch.bfloat16)
-        right = torch.randn(size, size, device="cuda", dtype=torch.bfloat16)
+        dtype_name = resolve_stream_dtype("cuda")
+        dtype = getattr(torch, dtype_name)
+        left = torch.randn(size, size, device="cuda", dtype=dtype)
+        right = torch.randn(size, size, device="cuda", dtype=dtype)
         try:
             for _ in range(3):  # warm up: the first matmul pays kernel selection
                 left @ right
@@ -558,7 +700,7 @@ class TestMeasuredGemmCeiling:
         independent = 2.0 * (size**3) * iters / seconds / 1e12
         assert 0.1 * independent <= got.tflops <= 10.0 * independent, (
             f"probe reported {got.tflops} TFLOPS where an independent timing of "
-            f"the same {size}^3 bf16 matmul gives {independent}"
+            f"the same {size}^3 {dtype_name} matmul gives {independent}"
         )
 
     def test_returns_none_on_cpu_rather_than_inventing_a_number(self):
@@ -586,10 +728,16 @@ class TestIssue444BestRepeatSelection:
     def test_gemm_ceiling_defaults_samples_to_empty_tuple(self) -> None:
         from soup_cli.utils.layer_stream_runtime import GemmCeiling
 
-        ceiling = GemmCeiling(tflops=10.5, sm_clock_mhz=1200, size=4096)
+        ceiling = GemmCeiling(
+            tflops=10.5,
+            sm_clock_mhz=1200,
+            size=4096,
+            dtype="bfloat16",
+        )
         assert ceiling.tflops == 10.5
         assert ceiling.sm_clock_mhz == 1200
         assert ceiling.size == 4096
+        assert ceiling.dtype == "bfloat16"
         assert ceiling.samples == ()
 
     def test_selection_picks_maximum_repeat_not_first_or_last(
@@ -638,6 +786,7 @@ class TestIssue444BestRepeatSelection:
 
         class _MockTorch:
             bfloat16 = "bfloat16"
+            float16 = "float16"
             cuda = _MockCuda
 
             @staticmethod
@@ -646,6 +795,13 @@ class TestIssue444BestRepeatSelection:
 
         monkeypatch.setitem(sys.modules, "torch", _MockTorch)
         monkeypatch.setattr(layer_stream_runtime, "sm_clock_mhz", lambda: 1500)
+        from soup_cli.utils import layer_stream
+
+        monkeypatch.setattr(
+            layer_stream,
+            "resolve_stream_dtype",
+            lambda device: "bfloat16",
+        )
 
         res = layer_stream_runtime.measure_gemm_tflops(
             device="cuda", iters=8, reps=4, size=4096
@@ -658,6 +814,78 @@ class TestIssue444BestRepeatSelection:
         assert res.tflops == res.samples[1]
         assert res.tflops != res.samples[0]
         assert res.tflops != res.samples[-1]
+
+    @pytest.mark.parametrize("resolved_dtype", ["float16", "bfloat16"])
+    def test_gemm_uses_resolved_stream_dtype(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        resolved_dtype: str,
+    ) -> None:
+        """The GEMM probe must use the card-resolved stream dtype."""
+        import sys
+
+        from soup_cli.utils import layer_stream, layer_stream_runtime
+
+        allocated_dtypes: list[object] = []
+
+        class _MockEvent:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def record(self) -> None:
+                pass
+
+            def elapsed_time(self, other: object) -> float:
+                return 100.0
+
+        class _MockCuda:
+            @staticmethod
+            def is_available() -> bool:
+                return True
+
+            @staticmethod
+            def synchronize() -> None:
+                pass
+
+            @staticmethod
+            def empty_cache() -> None:
+                pass
+
+            Event = _MockEvent
+            OutOfMemoryError = RuntimeError
+
+        class _MockTensor:
+            def __matmul__(self, other: object) -> "_MockTensor":
+                return self
+
+        class _MockTorch:
+            bfloat16 = "bfloat16"
+            float16 = "float16"
+            cuda = _MockCuda
+
+            @staticmethod
+            def randn(*args: object, **kwargs: object) -> _MockTensor:
+                allocated_dtypes.append(kwargs["dtype"])
+                return _MockTensor()
+
+        monkeypatch.setitem(sys.modules, "torch", _MockTorch)
+        monkeypatch.setattr(
+            layer_stream,
+            "resolve_stream_dtype",
+            lambda device: resolved_dtype,
+        )
+        monkeypatch.setattr(layer_stream_runtime, "sm_clock_mhz", lambda: 1500)
+
+        res = layer_stream_runtime.measure_gemm_tflops(
+            device="cuda",
+            iters=1,
+            reps=1,
+            size=4,
+        )
+
+        assert res is not None
+        assert res.dtype == resolved_dtype
+        assert allocated_dtypes == [resolved_dtype, resolved_dtype]
 
     def test_zero_elapsed_timing_returns_none(
         self, monkeypatch: pytest.MonkeyPatch
@@ -706,6 +934,13 @@ class TestIssue444BestRepeatSelection:
                 return _MockTensor()
 
         monkeypatch.setitem(sys.modules, "torch", _MockTorch)
+        from soup_cli.utils import layer_stream
+
+        monkeypatch.setattr(
+            layer_stream,
+            "resolve_stream_dtype",
+            lambda device: "bfloat16",
+        )
         got = layer_stream_runtime.measure_gemm_tflops(device="cuda", reps=4)
         assert got is None
 
@@ -756,8 +991,123 @@ class TestIssue444BestRepeatSelection:
                 return _MockTensor()
 
         monkeypatch.setitem(sys.modules, "torch", _MockTorch)
+        from soup_cli.utils import layer_stream
+
+        monkeypatch.setattr(
+            layer_stream,
+            "resolve_stream_dtype",
+            lambda device: "bfloat16",
+        )
         got = layer_stream_runtime.measure_gemm_tflops(device="cuda", iters=0, reps=4)
         assert got is None
+
+class TestIssue617PanelDtype:
+    """Regression coverage for the user-visible GEMM dtype in the stream panel."""
+
+    @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+    def test_stream_budget_panel_reports_measured_gemm_dtype(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        dtype: str,
+    ) -> None:
+        from types import SimpleNamespace
+
+        from soup_cli.trainer import stream_setup
+
+        class _Setup(stream_setup.StreamingSetupMixin):
+            _STREAM_ROWS_PER_EXAMPLE = 1
+
+            @staticmethod
+            def _stream_shape_config(model_config):
+                return model_config
+
+            @staticmethod
+            def _stream_intermediate_size(model_config):
+                return 128
+
+            @staticmethod
+            def _estimate_adapter_params(tcfg, model_config):
+                return 0
+
+        setup = object.__new__(_Setup)
+        setup.device = "cuda"
+
+        cfg = SimpleNamespace(
+            data=SimpleNamespace(max_length=16),
+        )
+        tcfg = SimpleNamespace(
+            batch_size=1,
+            stream_buffers=2,
+            stream_vram_probe=False,
+            stream_vram_override=None,
+            gradient_accumulation_steps=1,
+        )
+        model_config = SimpleNamespace(
+            vocab_size=1000,
+            hidden_size=64,
+        )
+        index = SimpleNamespace(
+            total_params=1_000_000,
+            n_layers=2,
+        )
+
+        monkeypatch.setattr(
+            stream_setup,
+            "console",
+            SimpleNamespace(print=lambda *args, **kwargs: None),
+        )
+
+        monkeypatch.setattr(
+            layer_stream_runtime,
+            "measure_gemm_tflops",
+            lambda device: SimpleNamespace(
+                tflops=6.75,
+                sm_clock_mhz=862,
+                dtype=dtype,
+            ),
+        )
+
+        monkeypatch.setattr(
+            layer_stream,
+            "resolve_available_vram_bytes",
+            lambda measured_bytes, override_bytes=None: 4_000_000_000,
+        )
+
+        monkeypatch.setattr(
+            layer_stream,
+            "decide_stream_fit",
+            lambda predicted_bytes, available_bytes: SimpleNamespace(
+                fits=True,
+                reason="fits",
+            ),
+        )
+
+        import torch
+
+        monkeypatch.setattr(
+            torch.cuda,
+            "mem_get_info",
+            lambda: (4_000_000_000, 8_000_000_000),
+        )
+
+        lines, plan = setup._stream_budget_lines(
+            cfg,
+            tcfg,
+            model_config=model_config,
+            layer_bytes=1_000_000,
+            embed_bytes=1_000_000,
+            index=index,
+            on_cuda=True,
+            large_layer_bytes=0,
+        )
+
+        assert plan is None
+
+        panel_text = "\n".join(lines)
+        assert (
+            f"(from 6.75 TFLOPS measured on this card now "
+            f"using {dtype} @ 862 MHz)"
+        ) in panel_text
 
 
 class TestBatchSizeIsSupported:
@@ -1230,6 +1580,24 @@ def _strip_ansi(text):
     return re.sub(r"\x1b\[[0-9;]*m", "", text).replace("\n", " ")
 
 
+#: #622 repro values: the reported 32B NF4 store fits the dynamic free-RAM
+#: headroom (16.10 GB < 27 GB * 0.70) but exceeds the physical-RAM ceiling
+#: once resident extras are included (16.10 GB + 3.114 GB >= 30 GB * 0.55).
+_ISSUE622_STORE_BYTES = 16_100_000_000
+_ISSUE622_RESIDENT_BYTES = 3_114_000_000
+_ISSUE622_SMALL_STORE_BYTES = 8_000_000_000
+_ISSUE622_FREE_RAM_BYTES = 27_000_000_000
+_ISSUE622_TOTAL_RAM_BYTES = 30_000_000_000
+_ISSUE622_REVIEW_TIGHT_FREE_RAM_BYTES = 10_000_000_000
+_ISSUE622_REVIEW_TOTAL_RAM_BYTES = 100_000_000_000
+_ISSUE622_REVIEW_STORE_BYTES = 5_000_000_000
+_ISSUE622_REVIEW_RESIDENT_BYTES = 3_000_000_000
+_ISSUE622_LAYERS = 64
+_ISSUE622_PSUTIL_TOTAL_BYTES = 123_456_789
+_ISSUE622_SCHEMA_PHYSICAL_TEXT = "physical RAM ceiling"
+_ISSUE622_SCHEMA_RESIDENT_TEXT = "resident extras"
+
+
 class TestTierProbeIsLazy:
     def test_ram_tier_never_pays_for_the_probe(self):
         """The measured reason this matters: the probe is ~9 s on Windows and
@@ -1256,6 +1624,197 @@ class TestTierProbeIsLazy:
 
         assert choose_tier(1000, 10, probe) == TIER_DISK
         assert calls == [1]
+
+
+class TestPhysicalRamBudget:
+    """#622: the RAM tier needs an absolute physical-host budget too.
+
+    The reported 32B NF4 run had plenty of ``MemAvailable`` for the old dynamic
+    check, but the pinned resident store plus extras consumed too much of the
+    physical host while 18 GB of safetensors shards were being read.
+    """
+
+    def test_auto_falls_to_disk_when_physical_ram_budget_is_exceeded(self):
+        from soup_cli.utils.layer_stream import TIER_DISK, choose_tier
+
+        assert (
+            choose_tier(
+                _ISSUE622_STORE_BYTES,
+                _ISSUE622_FREE_RAM_BYTES,
+                "nvme",
+                resident_bytes=_ISSUE622_RESIDENT_BYTES,
+                total_ram_bytes=_ISSUE622_TOTAL_RAM_BYTES,
+            )
+            == TIER_DISK
+        )
+
+    def test_physical_ceiling_refusal_names_why_disk_was_needed(self):
+        from soup_cli.utils.layer_stream import choose_tier
+
+        with pytest.raises(ValueError, match="store plus resident extras"):
+            choose_tier(
+                _ISSUE622_STORE_BYTES,
+                _ISSUE622_FREE_RAM_BYTES,
+                "hdd",
+                resident_bytes=_ISSUE622_RESIDENT_BYTES,
+                total_ram_bytes=_ISSUE622_TOTAL_RAM_BYTES,
+            )
+
+    def test_physical_ram_budget_keeps_ram_when_store_is_small(self):
+        from soup_cli.utils.layer_stream import TIER_RAM, choose_tier
+
+        probes = []
+
+        def probe():
+            probes.append("probed")
+            return "nvme"
+
+        assert (
+            choose_tier(
+                _ISSUE622_SMALL_STORE_BYTES,
+                _ISSUE622_FREE_RAM_BYTES,
+                probe,
+                total_ram_bytes=_ISSUE622_TOTAL_RAM_BYTES,
+            )
+            == TIER_RAM
+        )
+        assert probes == []
+
+    def test_free_ram_budget_counts_resident_extras(self):
+        from soup_cli.utils.layer_stream import TIER_DISK, choose_tier
+
+        assert (
+            choose_tier(
+                _ISSUE622_REVIEW_STORE_BYTES,
+                _ISSUE622_REVIEW_TIGHT_FREE_RAM_BYTES,
+                "nvme",
+                resident_bytes=_ISSUE622_REVIEW_RESIDENT_BYTES,
+                total_ram_bytes=_ISSUE622_REVIEW_TOTAL_RAM_BYTES,
+            )
+            == TIER_DISK
+        )
+
+    def test_free_ram_fallback_note_names_resident_extras(self):
+        from soup_cli.utils.layer_stream import TIER_DISK, build_stream_plan
+
+        plan = build_stream_plan(
+            arch="qwen2",
+            n_layers=_ISSUE622_LAYERS,
+            layer_bytes=_ISSUE622_REVIEW_STORE_BYTES // _ISSUE622_LAYERS,
+            embed_bytes=_ISSUE622_REVIEW_RESIDENT_BYTES,
+            store_bytes=_ISSUE622_REVIEW_STORE_BYTES,
+            available_ram_bytes=_ISSUE622_REVIEW_TIGHT_FREE_RAM_BYTES,
+            total_ram_bytes=_ISSUE622_REVIEW_TOTAL_RAM_BYTES,
+            pinned_limit_bytes=None,
+            disk_kind="nvme",
+        )
+
+        assert plan.tier == TIER_DISK
+        joined = " ".join(plan.notes)
+        assert "resident extras" in joined
+        assert "free-RAM" in joined
+
+    def test_auto_disk_fallback_names_the_physical_ram_ceiling(self):
+        from soup_cli.utils.layer_stream import TIER_DISK, build_stream_plan
+
+        plan = build_stream_plan(
+            arch="qwen2",
+            n_layers=_ISSUE622_LAYERS,
+            layer_bytes=_ISSUE622_STORE_BYTES // _ISSUE622_LAYERS,
+            embed_bytes=_ISSUE622_RESIDENT_BYTES,
+            store_bytes=_ISSUE622_STORE_BYTES,
+            available_ram_bytes=_ISSUE622_FREE_RAM_BYTES,
+            total_ram_bytes=_ISSUE622_TOTAL_RAM_BYTES,
+            pinned_limit_bytes=None,
+            disk_kind="nvme",
+        )
+
+        assert plan.tier == TIER_DISK
+        joined = " ".join(plan.notes)
+        assert "physical RAM" in joined
+        assert "55%" in joined
+        assert "stream_source='ram'" in joined
+
+    def test_forced_ram_refuses_when_physical_ram_budget_is_exceeded(self):
+        from soup_cli.trainer.stream_setup import _validate_qwen4_ngram_ram_fit
+
+        with pytest.raises(ValueError, match="physical RAM"):
+            _validate_qwen4_ngram_ram_fit(
+                stream_source="ram",
+                ngram_source="disk",
+                required_ram=_ISSUE622_STORE_BYTES,
+                free_ram=_ISSUE622_FREE_RAM_BYTES,
+                resident_ram=_ISSUE622_RESIDENT_BYTES,
+                total_ram=_ISSUE622_TOTAL_RAM_BYTES,
+            )
+
+    def test_forced_ram_free_budget_counts_resident_extras(self):
+        from soup_cli.trainer.stream_setup import _validate_qwen4_ngram_ram_fit
+
+        with pytest.raises(ValueError, match="resident extras"):
+            _validate_qwen4_ngram_ram_fit(
+                stream_source="ram",
+                ngram_source="disk",
+                required_ram=_ISSUE622_REVIEW_STORE_BYTES,
+                free_ram=_ISSUE622_REVIEW_TIGHT_FREE_RAM_BYTES,
+                resident_ram=_ISSUE622_REVIEW_RESIDENT_BYTES,
+                total_ram=_ISSUE622_REVIEW_TOTAL_RAM_BYTES,
+            )
+
+    def test_total_ram_bytes_reports_psutil_total(self, monkeypatch):
+        import sys
+        import types
+
+        from soup_cli.utils.layer_stream import total_ram_bytes
+
+        fake_psutil = types.SimpleNamespace(
+            virtual_memory=lambda: types.SimpleNamespace(total=_ISSUE622_PSUTIL_TOTAL_BYTES)
+        )
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        assert total_ram_bytes() == _ISSUE622_PSUTIL_TOTAL_BYTES
+
+    def test_total_ram_bytes_returns_none_when_psutil_is_missing(self, monkeypatch):
+        import builtins
+        import sys
+
+        from soup_cli.utils.layer_stream import total_ram_bytes
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "psutil":
+                raise ImportError(name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.delitem(sys.modules, "psutil", raising=False)
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        assert total_ram_bytes() is None
+
+    def test_total_ram_bytes_returns_none_when_psutil_cannot_report(self, monkeypatch):
+        import sys
+        import types
+
+        from soup_cli.utils.layer_stream import total_ram_bytes
+
+        def no_memory():
+            raise OSError("host probe failed")
+
+        monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(virtual_memory=no_memory))
+
+        assert total_ram_bytes() is None
+
+    def test_schema_descriptions_name_the_physical_ram_ceiling(self):
+        from soup_cli.config.schema import TrainingConfig
+
+        stream_source = TrainingConfig.model_fields["stream_source"].description
+        stream_ngram_source = TrainingConfig.model_fields["stream_ngram_source"].description
+
+        assert _ISSUE622_SCHEMA_PHYSICAL_TEXT in stream_source
+        assert _ISSUE622_SCHEMA_RESIDENT_TEXT in stream_source
+        assert _ISSUE622_SCHEMA_PHYSICAL_TEXT in stream_ngram_source
+        assert _ISSUE622_SCHEMA_RESIDENT_TEXT in stream_ngram_source
 
 
 # ==========================================================================

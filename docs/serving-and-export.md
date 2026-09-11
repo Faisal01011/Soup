@@ -302,6 +302,23 @@ soup serve --model ./output --backend sglang
 soup serve --model ./output --backend sglang --tensor-parallel 2
 ```
 
+Like the transformers and vLLM backends, the SGLang backend applies the
+**model's own chat template** via the same shared prompt builder (falling back
+to a generic `User:` / `Assistant:` prompt for template-less models), and
+`finish_reason` reports `"length"` when a response hits `max_tokens` and
+`"stop"` otherwise — so a client doing continue-on-length can tell a truncated
+answer from a completed one (#360).
+
+It also honours `--trust-remote-code` like every other backend. **This changed:**
+the SGLang runtime and its tokenizer previously loaded with `trust_remote_code`
+hardcoded on, so a model's custom repo code executed whether or not you opted in
+— the pre-flight panel announced it but offered no way to decline. A model that
+needs custom code now **fails to load** on this backend unless you pass the flag:
+
+```bash
+soup serve --model ./output --backend sglang --trust-remote-code
+```
+
 ### Speculative Decoding
 
 Use a smaller draft model to speed up generation. **Measure before you trust it** — see
@@ -529,7 +546,7 @@ soup ui
 
 **Pages:**
 - **Dashboard** — view all experiment runs, loss charts, system info, multi-run comparison
-- **New Training** — create configs from templates or 159 ready-made recipes, validate, start training with live SSE log streaming and progress bar
+- **New Training** — create configs from templates or 165 ready-made recipes, validate, start training with live SSE log streaming and progress bar
 - **Data Explorer** — browse and inspect datasets (JSONL, JSON, CSV, Parquet)
 - **Model Chat** — chat with streaming responses, configurable temperature/top_p/max_tokens, system prompt, adapter selection, markdown rendering, chat export
 
@@ -538,9 +555,11 @@ soup ui
 - **Enhanced Metrics** — 2x2 chart grid (loss, LR, grad_norm, throughput) + GPU memory chart, eval results table
 - **Multi-Run Compare** — overlay loss curves from up to 5 runs side-by-side
 - **Chat Upgrade** — SSE streaming via proxy, typing indicator, cancel button, markdown renderer (bold, italic, code blocks), chat export as JSON
-- **Config Builder** — recipe dropdown (159 recipes), config schema API for dynamic form generation
+- **Config Builder** — recipe dropdown (165 recipes), config schema API for dynamic form generation
 
-**Security:** The Web UI generates a random auth token at startup (printed to console). All mutating endpoints (start/stop training, delete runs, inspect data, validate config) require `Authorization: Bearer <token>` header. CORS is restricted to the served origin. Data inspection is sandboxed to the working directory.
+**Security:** The Web UI generates a random auth token at startup (printed to console). Every private endpoint — mutating (start/stop training, delete runs, inspect data, validate config) and reading (runs, metrics, system, recipes, SSE streams) — requires an `Authorization: Bearer <token>` header. `/` and `/api/health` stay open so the dashboard can load. CORS is restricted to the served origin. Data inspection is sandboxed to the working directory.
+
+**Interactive API docs are loopback-only.** `/openapi.json`, `/docs`, `/docs/oauth2-redirect` and `/redoc` serve on a loopback bind and are **absent** (404) on any other, including `soup ui --public`. This is deliberate rather than incidental: the schema exposes no run data, configuration or logs, but it does describe every route, parameter and request/response shape, and on a LAN bind that is free reconnaissance. Gating them behind the token instead was rejected — `/docs` is a browser navigation and Swagger cannot attach a Bearer header to it, so gating would break the page for a developer while leaving `/openapi.json` readable by any HTTP client. If you need the schema while bound publicly, read it from a loopback instance of the same version.
 
 ```bash
 # Custom port, don't auto-open browser
@@ -728,17 +747,23 @@ prompt-lookup decoding — no draft model required). Mutually exclusive with a r
 
 ## Server-Side Tool Endpoints
 
+v0.53.7 ships live server-side tool calling on `soup serve`.
 Three POST routes are now available on `soup serve`:
 
-- **`POST /v1/tools/python`** — Sandboxed Python execution. Requires Bearer token auth.
-  Wraps the RLVR sandbox with 5-second timeout and 64KB code cap. Returns 200 with
-  `stdout` / `stderr` / `return_value`; 400 on validation error; 401 on bad auth.
-
-- **`POST /v1/tools/web_search`** — Domain-allowlisted web search. Requires Bearer token
-  auth. Uses httpx backend with hard 5-second timeout and 5-result cap. Returns results
+- **`POST /v1/tools/python`** — runs caller-supplied Python code in an isolated
+  sub-process. Bounded by 512 MB memory, 5-second wall-clock timeout, and a
+  single-worker concurrency cap.
+- **`POST /v1/tools/web_search`** — searches the web and returns domain-filtered results
   as `[{url, title, snippet}]` with snippets sanitized (null bytes stripped).
   Deny-by-default via `WebSearchConfig.domain_allowlist`.
 
-- **`POST /v1/tools/bash`** — Deferred to v0.53.8. Current child-process isolation
-  insufficient for `/bin/sh -c` (subprocess escapes the RLVR sandbox). Returns 501 with
-  v0.53.8 marker pending container/namespace work.
+- **`POST /v1/tools/bash`** — runs a bash command with strict OS-level network
+  isolation (`unshare` on supported Linux runtimes, `sandbox-exec` on macOS).
+  Enforces mandatory Bearer token authentication when bound to a non-loopback host,
+  a 5-second wall-clock timeout, a minimal secret-scrubbed environment, and a combined
+  10KB stdout/stderr streaming kill limit. Returns the real stdout, stderr, exit code,
+  and timeout state. This is not a filesystem sandbox: the child retains the server
+  process's read access to world-readable system files. The endpoint fails closed with
+  HTTP 501 when strict OS isolation is unavailable (including on Windows or restricted
+  Linux containers).
+

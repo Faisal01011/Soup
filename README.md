@@ -1,3 +1,5 @@
+<p align="center">🌍 <strong>English</strong> | <a href="README.tr.md">Türkçe</a></p>
+
 <p align="center">
   <img src="soup.png" alt="Soup" width="280">
 </p>
@@ -11,11 +13,13 @@
 <p align="center">
   <a href="https://trysoup.dev">Website</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
+  <a href="#web-ui">Web UI</a> &middot;
   <a href="#configuration">Config</a> &middot;
   <a href="#documentation">Docs</a> &middot;
   <a href="docs/commands.md">Commands</a> &middot;
   <a href="docs/models.md">Models</a> &middot;
-  <a href="https://discord.gg/8RgVbFA6Zq">Discord</a> &middot;
+  <a href="https://discord.gg/dgd2pJcjwP">Discord</a> &middot;
+  <a href="https://t.me/souptasters">Telegram</a> &middot;
   <a href="https://www.producthunt.com/products/soup-cli">Product Hunt</a>
 </p>
 
@@ -27,7 +31,8 @@
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/MakazhanAlpamys/65fdc943f85f3b2c46ecddb415c2b779/raw/soup_tests.json" alt="Tests"></a>
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://trysoup.dev"><img src="https://img.shields.io/badge/website-trysoup.dev-blue" alt="Website"></a>
-  <a href="https://discord.gg/8RgVbFA6Zq"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://discord.gg/dgd2pJcjwP"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://t.me/souptasters"><img src="https://img.shields.io/badge/Telegram-join-26A5E4?logo=telegram&logoColor=white" alt="Telegram"></a>
   <a href="https://doi.org/10.5281/zenodo.21771064"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21771064-blue?logo=zenodo&logoColor=white" alt="DOI: 10.5281/zenodo.21771064"></a>
 </p>
 
@@ -82,54 +87,54 @@ infrastructure instead of improving models. Soup fixes that.
 
 ## What's New
 
+**v0.74.0 — the frozen base was being loaded in fp32 the whole time.** Fixing that
+alone cuts peak VRAM 2.59x on an unchanged config. **116 of the 120 merged pull
+requests in this release came from outside the maintainer**, by 25 people.
+
+- **Every SFT load silently upcast the frozen base to fp32.** A base that never
+  receives an optimizer step was materialised at twice its checkpoint precision, on
+  all three load paths. Measured on an H100 with Llama-3.1-8B + LoRA: **48,241 MiB →
+  18,658 MiB peak — 2.59x, 28.9 GB**, byte-identical across three repeats. A trainable
+  base still loads fp32, deliberately.
+- **Transformers 5.x, TRL 0.29, PEFT 0.20.** Qwen3.5-family text decoders train on the
+  Transformers path, and `pip install "soup-cli[train,mlx]"` resolves again — the two
+  extras previously declared ranges that could not be satisfied together.
+- **The free Colab/Kaggle tier could not stream at all.** T4 / P100 / V100 / GTX 16xx
+  crashed layer streaming, because peft creates LoRA adapters in the checkpoint's dtype
+  while the fp16 GradScaler needs fp32 gradients.
+- **Four SSRF bypasses of the same shape.** Abbreviated, decimal, hex and octal IPv4
+  spellings (`127.1`, `2130706433`, `0x7f000001`, `0177.0.0.1`) reached the telemetry
+  and webhook guard — and, through a path the first fix never touched, the OTLP
+  tracing validator.
+- **Breaking: `soup serve` now exits 2** when bound to a non-loopback host without
+  `--tool-auth-token`, instead of printing a warning. `/v1/tools/bash` is re-enabled
+  behind real OS-level isolation, so the endpoint it protects now actually executes.
+- **`soup train --cloud lambda`**, plan-only by default, with termination in a
+  `finally` that also polls to confirm it happened.
+
+> Known limitation: the declared `torch>=2.5.0` floor does not work with `trl>=0.29` —
+> at torch 2.5.1 trl cannot import. A fresh install resolves a newer torch and is
+> unaffected; a pinned 2.5.x environment is not. See
+> [#651](https://github.com/MakazhanAlpamys/Soup/issues/651).
+
+> Python **3.10–3.12** only. On 3.13+, pip used to resolve untested PyTorch wheels that
+> crash in the native extension before Soup runs at all.
+
+<details>
+<summary>Previous release — v0.73.3, every pull request came from outside the maintainer</summary>
+
 **v0.73.3 — every pull request in this release came from someone other than the
 maintainer.** All 24 of them, from eight people, five of whom appear here for the first
 time. What they found is the interesting part: four separate flags that were validated,
 documented, and then read by nothing.
-
 - **Assistant-only masking trained on zero tokens, with a normal loss curve.** A
   tokenizer returning `BatchEncoding` — which is not a `dict` — slipped past the guard,
   so the label mask was built from the mapping's **key strings**. No exception, no
   warning, a loss curve that looks like training. Found by reading the type, not by
   hitting the bug.
 - **On Apple Silicon, `quantization: 4bit` was silently rewritten to `none`.**
-  `detect_device()` did not know MLX, so every run reported "CPU (no GPU detected)" and
-  quietly downgraded. The label was never the harm; the quantization decision is now
-  explicit and testable instead of hidden inside a 900-line function.
-- **`soup train --no-reexec` printed a launch command with your own flags missing** —
-  follow it literally and you trained without `--fsdp`, and **the run succeeded**, so
-  nothing pointed back at the hint. Two hand-maintained copies of "what the user typed";
-  the printed one is deleted, and the hint now derives from the argv that actually
-  launches the run.
-- **`training.bnb_4bit_use_double_quant` was read by nothing.** Every 4-bit path
-  hardcoded `True`, so setting it to `false` changed your config fingerprint and nothing
-  else. Fixing it correctly also meant *not* defaulting the field: a plain `True` breaks
-  round-tripping for 21 of 173 shipped configs.
-- **On Windows, a process that genuinely exits with code 259 read as alive forever**,
-  because that is also `STILL_ACTIVE`. It defeated run reconciliation and could wedge the
-  MCP execution cap shut with no error an operator could act on.
-- **New: `soup mcp serve --allow-execute`** runs a planned training or export behind a
-  single-use, server-generated confirmation token — no command, no argv, no
-  client-supplied environment — with the config snapshotted at plan time and protected
-  paths digested by content, so a model cannot be swapped between planning and running.
 
-The measurement record for the earlier VRAM work, published as written — including the
-**three readings withdrawn during it** — is
-[`benchmarks/gate-v0.73.1-measured-vram-fit.md`](benchmarks/gate-v0.73.1-measured-vram-fit.md).
-
-```yaml
-# soup.yaml — then just `soup train --config soup.yaml`
-training:
-  stream_layers: true      # base streams out of VRAM; only the adapter trains
-  quantization: 4bit       # NF4 — ~4x smaller store, so 8B fits a 4 GB card
-  batch_size: 4            # bigger batches amortise the weight read
-  stream_source: auto      # RAM when it fits, NVMe disk when it does not
-  seed: 1234               # new in v0.73.0
-```
-
-> Python **3.10–3.12** only. v0.73.0 adds the upper bound that was missing: on 3.13+, pip
-> used to resolve untested PyTorch wheels that crash in the native extension before Soup
-> runs at all.
+</details>
 
 <details>
 <summary>Previous release — v0.72.4, align on a laptop (DPO / ORPO / SimPO / KTO over layer streaming)</summary>
@@ -164,29 +169,6 @@ soup reward synth references.jsonl -o reward.py --output-report calib.json
 
 </details>
 
-<details>
-<summary>Previous release — v0.71.39, CI for weights not prompts (emit + provenance-bind the ship verdict)</summary>
-
-`soup ship`'s verdict became emittable, committable, and provenance-bound: `--emit-evidence` makes a
-run replay into an identical verdict, `eval.ship` in `soup.yaml` + `--config` makes the gate policy
-reviewable, and `--config` binds evidence to the exact recipe that produced it (stale evidence → exit 3).
-`soup ship --push owner/repo#N` posts the SHIP / DON'T-SHIP card on the PR.
-
-</details>
-
-<details>
-<summary>Previous release — v0.71.38, The gate grows teeth (real leg-2 regression gate)</summary>
-
-`soup ship`'s regression leg became real: a fixed, extraction-based scorer over seven bundled,
-offline suites (MCQ · arithmetic · tool-calling · JSON validity · safety/refusal). A tune that
-wins your task but quietly breaks tool-calling now gets a **DON'T SHIP**. Zero new deps.
-
-```bash
-soup ship --base ./base --adapter ./my-lora --task-eval my_task.jsonl
-#   exit 0 = SHIP · 2 = DON'T SHIP · 3 = bad flags · 1 = runtime error
-```
-
-</details>
 
 Full history: [CHANGELOG.md](CHANGELOG.md) &middot; [GitHub Releases](https://github.com/MakazhanAlpamys/Soup/releases).
 
@@ -194,22 +176,46 @@ Full history: [CHANGELOG.md](CHANGELOG.md) &middot; [GitHub Releases](https://gi
 
 ### 1. Install
 
+Soup is a command-line application, so the cleanest install gives it its own
+environment and puts `soup` on your `PATH`:
+
 ```bash
 # Light core: CLI + config + data tools, no PyTorch
-pip install soup-cli
+pipx install soup-cli
+uv tool install soup-cli          # same idea, if you already use uv
 
 # Add the training stack (torch, transformers, peft, trl, datasets, …)
-pip install "soup-cli[train]"
+pipx install "soup-cli[train]"
 
 # Everything (train + serve + ui + data) in one shot
-pip install "soup-cli[all]"
+pipx install "soup-cli[all]"
 
 # Or from GitHub (latest dev)
+pipx install "git+https://github.com/MakazhanAlpamys/Soup.git"
+```
+
+Already inside a virtualenv, a Colab notebook, or a Docker image? Use `pip`
+directly, with the same names and extras:
+
+```bash
+pip install soup-cli
+pip install "soup-cli[train]"
+pip install "soup-cli[all]"
 pip install git+https://github.com/MakazhanAlpamys/Soup.git
 ```
 
+Use `pip` rather than `pipx` if you also want to `import soup_cli` from your own
+code, since pipx deliberately isolates the application from everything else.
+
 The full extras table (`fast`, `mlx`, `serve`, `eval`, `ui`, `vision`, `audio`, …) lives in
 [`docs/models.md`](docs/models.md#optional-extras).
+
+> **`error: externally-managed-environment`?** That is
+> [PEP 668](https://peps.python.org/pep-0668/), not a Soup problem. Debian 12,
+> Ubuntu 23.04 and later stop `pip` from writing into the system Python, because
+> `apt` manages those files too. `pipx` and `uv tool` sidestep it by giving Soup
+> its own environment, which is why they are listed first above. `python3 -m venv
+> .venv && source .venv/bin/activate` then plain `pip` works just as well.
 
 > **Double quotes, not single.** `"soup-cli[train]"` is the only spelling that works in every
 > shell — `cmd.exe`, PowerShell, bash and zsh. If you copied `'soup-cli[train]'` from an older
@@ -243,6 +249,21 @@ soup export --model ./output --format gguf --quant q4_k_m   # GGUF for Ollama / 
 More export targets (ONNX, TensorRT, AWQ, GPTQ, BitNet) and deployment options live in
 [`docs/serving-and-export.md`](docs/serving-and-export.md).
 
+## Web UI
+
+Prefer a browser? `soup ui` serves a local dashboard for experiments,
+training setup, live metrics, dataset exploration and model chat.
+
+```bash
+pip install "soup-cli[ui]"
+soup ui
+# Opens http://127.0.0.1:7860
+```
+
+![Soup Web UI — New Training](docs/assets/web-ui-new-training.png)
+
+[Web UI documentation](docs/serving-and-export.md#web-ui)
+
 ## Configuration
 
 A complete `soup.yaml`:
@@ -271,6 +292,14 @@ output: ./output
 
 `config/schema.py` is the single source of truth for every field. Advanced data, training,
 and PEFT options are documented under [Documentation](#documentation).
+
+> **Unknown config keys warn today and will be rejected in v0.75.** A key no model
+> declares — a typo like `quantizaton`, or a field that only exists on a newer Soup —
+> used to validate clean and be discarded, so the run proceeded with the setting simply
+> not applied. It is now reported at load with the field you probably meant. From
+> **v0.75** the same config will fail to load instead of warning, so fix or remove the
+> key rather than relying on it being ignored. See
+> [Unknown config keys](docs/backends-and-ops.md#unknown-config-keys).
 
 ## Documentation
 
@@ -306,6 +335,7 @@ soup train  --config soup.yaml        # train (SFT/DPO/GRPO/PPO/KTO/ORPO/SimPO/I
 soup infer  --model ./output --input prompts.jsonl   # batch inference
 soup chat   --model ./output          # interactive chat
 soup serve  --model ./output          # OpenAI-compatible API server
+soup ui                               # local browser dashboard
 soup merge  --adapter ./output        # merge LoRA into the base model
 soup export --model ./output --format gguf           # export for deployment
 soup eval   benchmark --model ./output               # evaluate
@@ -362,9 +392,7 @@ All training tasks run on CPU for testing (quantization auto-disabled). Optional
 soup doctor    # GPU, system resources, dependencies, and version in one place
 ```
 
-- **`ImportError: DLL load failed while importing _C` (Windows)** — reinstall PyTorch for your
-  CUDA version: `pip install torch --index-url https://download.pytorch.org/whl/cu121`.
-- **`soup version` ≠ `pip show soup-cli`** — multiple Python installs; use a virtualenv.
+CUDA wheels, version mismatches: [`docs/backends-and-ops.md`](docs/backends-and-ops.md#troubleshooting).
 
 ## Development
 
@@ -381,7 +409,7 @@ pre-commit install                 # optional: ruff lint+format on commit
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow and [SECURITY.md](SECURITY.md) to
-report a vulnerability.
+report a vulnerability. Telemetry is strictly opt-in (`SOUP_TELEMETRY=1`, default off; see [Privacy Policy](docs/backends-and-ops.md#privacy-policy)).
 
 ## Support Soup
 
@@ -422,7 +450,8 @@ Bugs and feature requests belong in the
 and help the next person with the same problem.
 
 For live chat, setup help, and everything that reads better as a conversation, join the
-[Discord](https://discord.gg/8RgVbFA6Zq). Anything that should still be findable in six months
+[Discord](https://discord.gg/dgd2pJcjwP) or the [Telegram community](https://t.me/souptasters).
+Anything that should still be findable in six months
 belongs in Issues or Discussions — a Discord answer helps one person, an issue helps everyone
 who hits the same thing. The [Code of Conduct](CODE_OF_CONDUCT.md) applies there too.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+import re
 import sys
 
 import typer
@@ -14,15 +15,20 @@ from soup_cli.utils.constants import GITHUB_URL
 
 console = Console()
 
+
 # Dependencies to check: (import_name, package_name, min_version, required)
 DEPS = [
-    ("torch", "torch", "2.0.0", True),
+    # The torch floor is declared once, in pyproject.toml's [train] extra.
+    # This literal is a copy, pinned to the declaration by
+    # tests/test_issue636_torch_floor.py — reading installed metadata instead
+    # would report the install's history, not the declaration (#636).
+    ("torch", "torch", "2.6.0", True),
     ("transformers", "transformers", "5.16.1", True),
     ("peft", "peft", "0.20.0", True),
     ("trl", "trl", "0.29.0", True),
     ("datasets", "datasets", "2.14.0", True),
     ("bitsandbytes", "bitsandbytes", "0.41.0", True),
-    ("accelerate", "accelerate", "0.25.0", True),
+    ("accelerate", "accelerate", "0.27.0", True),
     ("pydantic", "pydantic", "2.0.0", True),
     ("typer", "typer", "0.9.0", True),
     ("rich", "rich", "13.0.0", True),
@@ -65,6 +71,15 @@ def doctor(
             "on Windows, and on Linux it WRITES a ~64 MiB scratch file "
             "(.soup-diskprobe-*, git-ignored) into the current directory to "
             "measure sequential read throughput."
+        ),
+    ),
+    config: str | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help=(
+            "Also check a soup.yaml: report which of the settings it actually "
+            "sets are not read on its task and backend (#755)."
         ),
     ),
 ):
@@ -177,7 +192,74 @@ def doctor(
     else:
         console.print("\n[bold green]All checks passed![/] Your environment is ready.")
 
+    # After the environment summary on purpose: "All checks passed" reports on
+    # the environment, and printing config findings above it read as though the
+    # green line covered them too.
+    if config:
+        _check_config_support(config)
+
     console.print(f"\n[dim]GitHub: [link={GITHUB_URL}]{GITHUB_URL}[/link][/]")
+
+
+def _check_config_support(config_path: str) -> None:
+    """#755 — report the settings this config sets that its backend never reads.
+
+    Only fields the user actually wrote are listed. A wall of 275 rows is not a
+    pre-flight check, and the fields sitting at their schema default are not
+    what anyone came here to ask about.
+    """
+    from soup_cli.config.backend_support import DEFAULT_BACKEND, check_config
+
+    try:
+        from soup_cli.config.loader import load_config
+
+        cfg = load_config(config_path)
+    except FileNotFoundError as exc:
+        console.print(f"\n[red]Config not found:[/] {config_path}")
+        # Non-zero deliberately: this leg is meant to be gate-able in CI, and a
+        # config that cannot be read is not a clean bill of health. `doctor`
+        # without --config keeps its old exit status.
+        raise typer.Exit(2) from exc
+    except SystemExit as exc:
+        # load_config prints its own diagnosis and raises SystemExit(1) for a
+        # schema-invalid config. SystemExit is a BaseException, so it walks
+        # past `except Exception` and the exit code contradicted the 2
+        # documented in docs/commands.md. Re-raised as 2 so all three unreadable
+        # shapes -- missing, unparseable, schema-invalid -- agree.
+        console.print("\n[red]Config could not be loaded (see above).[/]")
+        raise typer.Exit(2) from exc
+    except Exception as exc:  # invalid YAML, unreadable file
+        console.print(f"\n[red]Config could not be loaded:[/] {exc}")
+        raise typer.Exit(2) from exc
+
+    backend = getattr(cfg, "backend", DEFAULT_BACKEND)
+    gaps = check_config(cfg)
+
+    console.print(
+        f"\n[bold]Config check[/] - task=[bold]{cfg.task}[/] "
+        f"backend=[bold]{backend}[/]"
+    )
+    if not gaps:
+        console.print(
+            "  [green]Every setting this config writes is read on this backend.[/]"
+        )
+        return
+
+    table = Table(title=None, show_header=True)
+    # overflow="fold" on both text columns: a dotted field name is one
+    # unbreakable word, so Rich ellipsises it on a narrow terminal and the row
+    # says a setting is ignored without saying which one. Folding keeps the
+    # name and the reason legible at any width.
+    table.add_column("setting", style="bold", overflow="fold")
+    table.add_column("status", justify="center")
+    table.add_column("why", overflow="fold")
+    for entry in gaps:
+        table.add_row(entry.field, f"[yellow]{entry.status}[/]", entry.describe())
+    console.print(table)
+    console.print(
+        f"  [yellow]{len(gaps)} setting(s) written here are not read on "
+        f"backend={backend}.[/]"
+    )
 
 
 def _get_mlx_info() -> dict:
@@ -246,18 +328,88 @@ def _check_gpu():
         )
 
 
+# Newest-first PyTorch CUDA wheel tags. A driver that advertises CUDA N.M can
+# load any wheel whose CUDA is <= N.M (driver backward compatibility).
+_TORCH_CUDA_WHEELS: tuple[tuple[int, int, str], ...] = (
+    (13, 2, "cu132"),
+    (13, 0, "cu130"),
+    (12, 8, "cu128"),
+    (12, 6, "cu126"),
+    (12, 4, "cu124"),
+    (12, 1, "cu121"),
+    (11, 8, "cu118"),
+)
+
+
+def _parse_cuda_version(text: str) -> tuple[int, int] | None:
+    """Extract ``(major, minor)`` from nvidia-smi ``CUDA Version: X.Y`` text."""
+    match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", text or "")
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _torch_cuda_wheel_tag(driver: tuple[int, int] | None) -> str:
+    """Pick the newest PyTorch CUDA wheel the driver can run.
+
+    ``None`` (unreadable nvidia-smi header) falls back to ``cu121``, not
+    ``cu130``: a parse failure is treated as an old driver. A too-new wheel
+    is the failure mode that looks like success (pip ok, CUDA init dies).
+    A known 13.2 header still maps to ``cu132``. Drivers older than every
+    table row get ``cu118``, the oldest published tag.
+    """
+    if driver is None:
+        return "cu121"
+    for major, minor, tag in _TORCH_CUDA_WHEELS:
+        if driver >= (major, minor):
+            return tag
+    return "cu118"
+
+
+def _nvidia_smi_executable() -> str | None:
+    """Absolute path to nvidia-smi, or None.
+
+    Bare ``nvidia-smi`` is never handed to ``subprocess`` (CWE-427):
+    Windows ``CreateProcess`` searches the current directory before PATH.
+    """
+    import shutil
+
+    return shutil.which("nvidia-smi")
+
+
+def _nvidia_smi_cuda_version() -> tuple[int, int] | None:
+    """Read the driver's max CUDA version from ``nvidia-smi`` header output."""
+    import subprocess
+
+    nvidia_smi = _nvidia_smi_executable()
+    if nvidia_smi is None:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 — argv list, no shell
+            [nvidia_smi],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return _parse_cuda_version((completed.stdout or "") + (completed.stderr or ""))
+
+
 def _detect_gpu_hw_without_torch_cuda() -> str:
     """v0.40.1 Part C / N3 — return advisory string if nvidia-smi succeeds
     but torch lacks CUDA (i.e. user installed the CPU-only wheel).
     """
-    import shutil
     import subprocess
 
-    if shutil.which("nvidia-smi") is None:
+    nvidia_smi = _nvidia_smi_executable()
+    if nvidia_smi is None:
         return ""
     try:
         completed = subprocess.run(  # noqa: S603 — argv list, no shell
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -280,10 +432,16 @@ def _detect_gpu_hw_without_torch_cuda() -> str:
         torch_version = _pkgver("torch")
     except Exception:  # noqa: BLE001
         torch_version = "?"
+    wheel = _torch_cuda_wheel_tag(_nvidia_smi_cuda_version())
+    index_url = f"https://download.pytorch.org/whl/{wheel}"
+    windows_note = ""
+    if platform.system() == "Windows":
+        windows_note = " On Windows, PyPI's torch wheel is CPU-only."
     return (
         f"GPU hardware present ({gpu_label}) but torch is the CPU build "
         f"(torch {torch_version}). To enable your GPU: "
-        f"`pip install torch --index-url https://download.pytorch.org/whl/cu121`"
+        f"`pip install torch --index-url {index_url}`"
+        f"{windows_note}"
     )
 
 

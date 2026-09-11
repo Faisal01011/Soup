@@ -22,7 +22,7 @@ soup train --config soup.yaml --gate evals/gate.yaml  Eval-gated training
 soup train --config soup.yaml --push-as user/repo  Auto-push each checkpoint to HF as branch
 soup train --config soup.yaml --push-as user/repo --hf-resume  Resume from latest HF checkpoint branch
 soup train --config soup.yaml --find-lr        LR range finder: write recommended LR JSON
-soup train --config soup.yaml --cloud modal --gpu a100  Render a Modal.com app for serverless GPU training (plan-only; --cloud-submit submits live)
+soup train --config soup.yaml --cloud modal|lambda --gpu a100  Render a cloud GPU controller (plan-only; --cloud-submit submits live)
 soup infer --model ./output --input p.jsonl   Batch inference
 soup infer --task asr --model <whisper|adapter> --input a.jsonl --output o.jsonl [--audio-dir d --asr-language en --asr-task transcribe|translate]  Whisper transcription + WER/CER
 soup chat --model ./output                    Interactive chat
@@ -34,7 +34,7 @@ soup merge-sharded-fsdp-weights ./shards -o merged.safetensors  Consolidate FSDP
 soup delinearize-llama4 ./src --target ./out [--num-experts N] [--plan-only]  Live Llama-4 fused-expert reshape [E*din,dout] -> [E,din,dout] + sidecar copy (v0.71.21)
 soup spectrum scan --model <id|path> --top-percent 50 [--modules mlp,attn] [-o patch.yaml]  Spectrum SNR scan (no model load) -> training.unfrozen_parameters YAML patch (v0.71.23)
 soup train --config sft.yaml  # training.lisa_enabled: true [lisa_num_layers lisa_interval_steps lisa_train_embeddings]  LISA layerwise importance sampling — full-FT quality at LoRA-like memory; lisa_train_embeddings: false freezes embeddings+head+norm for the memory saving (sft or pretrain/transformers/text/quantization=none) (v0.71.34, pretrain #307, #377)
-soup train --config sft.yaml  # training.stream_layers: true [stream_source stream_buffers]  BETA layer streaming — the frozen base streams from CPU RAM/NVMe one decoder layer at a time; embed_tokens + untied lm_head reuse one large-layer device slot; quantization: 4bit streams decoder layers as NF4, ~4x smaller (sft/dpo/orpo/simpo/kto on transformers+text, 9 archs; grpo/ppo permanently excluded) (v0.72.0; NF4 v0.72.2; disk+batch+accum v0.72.3; preference losses v0.72.4; large-layer slot #324)
+soup train --config sft.yaml  # training.stream_layers: true [stream_source stream_ngram_source stream_buffers]  BETA layer streaming — the frozen base streams from CPU RAM/NVMe one decoder layer at a time; Qwen4-Exp PLE rows can stream read-only from original safetensors; embed_tokens + untied lm_head reuse one large-layer device slot; quantization: 4bit streams validated decoder families as NF4, ~4x smaller (sft/dpo/orpo/simpo/kto on transformers+text, 10 archs; grpo/ppo permanently excluded) (v0.72.0; NF4 v0.72.2; disk+batch+accum v0.72.3; preference losses v0.72.4; Qwen4 PLE #602)
 soup export --model ./output --format gguf    Export to GGUF (Ollama)
 soup export --model ./output --deploy ollama  Export GGUF + auto-deploy to Ollama
 soup export --model ./output --format onnx    Export to ONNX
@@ -152,7 +152,7 @@ soup migrate --from llamafactory config.yaml  Import config from LLaMA-Factory
 soup migrate --from axolotl config.yml        Import config from Axolotl
 soup migrate --from unsloth notebook.ipynb    Import config from Unsloth notebook
 soup migrate --from llamafactory c.yaml --dry-run  Preview without writing
-soup recipes list                             List all 159 ready-made recipes
+soup recipes list                             List all 165 ready-made recipes
 soup recipes show llama3.1-8b-sft            Print recipe YAML
 soup recipes use llama3.1-8b-sft             Copy recipe to soup.yaml
 soup recipes search "reasoning"              Search by keyword/task/size
@@ -210,12 +210,13 @@ soup tui                                      Full-screen Textual dashboard (req
 soup train --config soup.yaml --profile       Record torch.profiler trace to <output>/profiles/
 soup --log-level quiet|normal|verbose|debug   Global logging tier (Rich-formatted)
 soup ui [--port 7860]                         Web UI (experiments, training, data)
-soup ui --public [--auth-token T]             Phone-scannable Web UI (v0.53.9)
+soup ui --public [--auth-token T]             Phone-scannable Web UI (v0.53.9); /docs + /openapi.json are loopback-only
 soup tokenizer train --input c.jsonl --vocab-size N  Train BPE tokenizer (v0.53.9)
 soup bench <model> --p50 --p95                Bench with tail-latency percentiles (v0.53.9)
 soup bench <model> --backend auto             Auto-detect transformers/mlx backend (v0.53.9)
 soup serve --reasoning-parser deepseek-r1     Strip <think> blocks from responses (v0.53.9)
-soup doctor [--nccl] [--disk]                 Check environment (optionally check NCCL bandwidth, media type; --disk ~9s cold / ~2.4s warm)
+soup doctor [--nccl] [--disk] [--config F]    Check environment (optionally check NCCL bandwidth, media type; --disk ~9s cold / ~2.4s warm).
+                                              --config also reports which settings that config writes are not read on its task/backend (#755); exits 2 if it cannot be read.
 soup monitor                                  NVIDIA / Apple Silicon GPU monitor: util / temp / VRAM / power
 soup quickstart [--dry-run]                   Full demo
 soup plugins list|install|enable|disable      Manage Soup plugins
@@ -251,6 +252,7 @@ soup serve --steer <name> [--steer-strength <s>]  Apply a steering vector at dec
 soup serve --bank <bank.json> [--bank-strength <s>]  Multi-tenant VeRA/VB-LoRA serving; active user per request via X-User-Id header, ContextVar-isolated (v0.71.12 / v0.71.17)
 soup serve --mole <dir>                              Serve a trained MoLE: base + N frozen task LoRAs + mole_gate.pt, blended per-token at decode (transformers-only) (v0.71.17)
 soup ingest --source langfuse|langsmith|helicone|openpipe|otel|openai-stored --logs <jsonl>  Universal trace importer (6 SaaS adapters → normalised JSONL)
+soup ingest --source langfuse --pull [--since 7d --max-pages 100 --allow-private-host]  Live pull of Langfuse generations (Observations API v2; LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST) (#204)
 soup prune-prompt --input <jsonl> --output <jsonl> --min-frequency 0.95  Detect + strip shared system-prompt prefix
 soup prune-prompt ... --tokenizer <id-or-path>  Tokenizer-aware prefix detection (decodes remaining ids, boundary-safe)
 soup data active-sample --input <jsonl> --output <jsonl> --budget N  Top-N uncertain prod traces for human review
@@ -302,15 +304,15 @@ soup build <manifest.yaml> [--dry-run] [--output-dir <dir>]  dbt-for-SFT DAG: va
 soup expect <data.jsonl> <suite.yaml>         Expectations suite: PII / token-length / refusal / judge (v0.69.0)
 soup data gen-magpie --base <m> --provider ollama|vllm --target N --output <jsonl> [--base-url <url>] [--quality-filter]  Magpie synthetic generator — live (v0.69.0; live v0.71.6)
 soup data best-of-n (--base <m> | --provider ollama|vllm --model <m> [--base-url <url>]) --prompts <jsonl> --n 8 --judge <url> -o <sft.jsonl> [--emit-pairs <dpo.jsonl>] [--resume] [--checkpoint <journal.jsonl>] [--manifest <manifest.json>]  Best-of-N rejection sampling with durable per-prompt recovery and manifest-last publication
-soup data best-of-n (--base <m> [--revision <rev>] | --provider ollama|vllm --model <m>) --prompts <jsonl> --n 8 --export-candidates <jsonl>  Sampling-only phase; no judge is constructed
-soup data best-of-n --candidate-artifact <jsonl> --judgments <jsonl> -o <sft.jsonl> [--emit-pairs <dpo.jsonl>]  Validate offline judgments and materialize byte-stable training rows without a model or network
+soup data best-of-n (--base <m> [--revision <rev>] | --provider ollama|vllm --model <m>) --prompts <jsonl> --n 8 --export-candidates <jsonl> [--checkpoint <jsonl>] [--resume]  Resumable sampling-only phase; no judge is constructed
+soup data best-of-n --candidate-artifact <jsonl> --judgments <jsonl> -o <sft.jsonl> [--emit-pairs <dpo.jsonl>] [--manifest <json>]  Validate offline judgments and materialize byte-stable training rows; a final manifest binds the requested output set
 soup data evolve --input <seeds.jsonl> --provider ollama|vllm --model <m> --strategy depth|breadth --rounds N -o <jsonl>  Evol-Instruct (WizardLM) instruction evolution (v0.71.31)
 soup data persona-mix --prompts <jsonl> --n N --output <jsonl>  Persona-Hub diversity sampler (v0.69.0)
 soup data brain-rot <data.jsonl> [--strict]   Brain-rot detector — arXiv 2510.13928 (v0.69.0)
 soup iterative-dpo --base-model <m> --reward-model <rm> --prompts <p.jsonl> --output-dir <out> --rounds N --pairs-per-round N [--plan-only]  Iterative DPO loop driver — LIVE sample→score→pair→train (v0.70.0; live v0.71.11)
 soup train --reward-hack-detector info_rm|rm_ensemble [--reward-hack-halt]  Reward-hacking detector for GRPO — LIVE callback (v0.70.0; live v0.71.11)
 soup train --reward-hack-mitigation off|log_only|kl_control|pid_lagrangian  Closed-loop reward-hacking auto-mitigation (detect → raise KL/β → rollback → early-stop); GRPO/PPO, requires --reward-hack-detector; PPO BETA (v0.71.26)
-soup train --uld-strategy wasserstein|topk_align [--uld-top-k N]  Cross-tokenizer ULD on task='distill' — LIVE W1/topk loss (v0.70.0; live v0.71.11)
+soup train --uld-strategy wasserstein_aligned  Cross-tokenizer ULD on task='distill' (different tokenizers) — LIVE (v0.71.18)
 soup train --minillm-enabled [--minillm-teacher-mix-ratio 0.3]  MiniLLM reverse-KL distillation — LIVE (v0.70.0; live v0.71.11)
 soup train --rl-checkpoint-save-every-steps N [--rl-checkpoint-keep-last N]  Mid-epoch checkpoint for GRPO/PPO — LIVE (v0.70.0; live v0.71.11)
 soup train --echo-trap-enabled [--echo-trap-threshold 0.6 --echo-trap-halt]  RAGEN echo-trap detector for GRPO — LIVE callback (v0.70.0; live v0.71.11)
@@ -343,6 +345,12 @@ written last and records their row counts and SHA-256 digests. Consumers should
 treat only files listed by that final manifest as committed output. Invalid
 local data such as a non-finite judge score remains a validation failure rather
 than being presented as a recoverable backend outage.
+
+For offline Best-of-N, the candidate and judgment artifacts are the recovery
+checkpoint. Offline materialization rejects `--resume` and `--checkpoint`; rerun
+the exact materialization command after a late failure. The final manifest is
+written last and is the only commit marker; consumers must verify it and use only
+the SFT/DPO files it lists.
 
 ## Fine-tune from your coding agent (MCP)
 

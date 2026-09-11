@@ -252,3 +252,216 @@ def test_help_renders():
 
     def test_unparseable_source_does_not_explode(self):
         assert find_raw_help_assertions("def broken(:\n") == []
+
+
+# ---------------------------------------------------------------------------
+# #633 — the same hazard, on subcommands the `--help` scan never reaches.
+# ---------------------------------------------------------------------------
+
+#: Commands whose output is **syntax highlighted**. Rich renders these through
+#: Pygments, which emits SGR escapes *between* the tokens of one logical line:
+#: ``modality``, ``:`` and ``text`` are three tokens, so ``"modality: text"`` is
+#: not a substring of the rendered output and ``yaml.safe_load`` rejects
+#: ``\x1b``. Plain ``console.print`` output is not affected the same way -- an
+#: unstyled message is wrapped in escapes rather than split by them. Two
+#: mechanisms are in play here, not one: ``recipes show`` and ``migrate`` render
+#: through ``Syntax(...)`` i.e. Pygments, while ``data mix --apply`` uses plain
+#: ``console.print`` and is split by Rich's default ``ReprHighlighter`` instead.
+#: The scanner keys on the INVOCATION rather than the mechanism, which is why it
+#: covers both; the suite's ~200 other raw-output assertions are left alone.
+_HIGHLIGHTED_INVOCATIONS = (
+    re.compile(r'"recipes"\s*,\s*"show"'),
+    re.compile(r"'recipes'\s*,\s*'show'"),
+    re.compile(r'"mix"\s*,\s*"--(apply|optimize)"'),
+    re.compile(r"'mix'\s*,\s*'--(apply|optimize)'"),
+    # `soup migrate` is the third `Syntax(...)` site in `src/`
+    # (commands/migrate.py:121). Latent rather than live: no assertion on its
+    # output is multi-token today, so this flags nothing now. Added by the
+    # maintainer after review so the guard covers every highlighted command
+    # rather than the two this issue happened to surface.
+    re.compile(r'"migrate"'),
+    re.compile(r"'migrate'"),
+)
+
+_PARSES_OUTPUT = re.compile(r"(yaml\.safe_load|json\.loads)\s*\(")
+
+#: Broader than ``_RAW_OUTPUT_RE``, which anchors on the exact name
+#: ``result.output`` and therefore cannot match ``show_result.output`` -- ``_``
+#: is a word character, so ``\b`` never fires before ``result`` there. Real
+#: tests name their results ``show_result`` / ``use_result`` all the time.
+_ANY_RAW_OUTPUT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.(output|stdout)\b|readouterr\(\)")
+_STRING_LITERAL = re.compile(r'"([^"]{2,})"' + r"|'([^']{2,})'")
+
+
+def _is_multi_token(literal: str) -> bool:
+    """A literal that Pygments would split across tokens.
+
+    The hazard is YAML *structure*. ``modality: text`` is three tokens -- key,
+    punctuation, value -- with escapes between them, and ``train:`` is two. A
+    bare model id (``Qwen/Qwen3.8-27B``) is one token and survives raw, which is
+    why neighbouring assertions in the same file kept passing.
+
+    A plain message such as ``"validation failed"`` is also safe: Rich wraps an
+    unstyled string in escapes rather than splitting it, so requiring a colon
+    keeps the guard on the assertions that actually break rather than every
+    substring containing a space.
+    """
+    return ":" in literal
+
+
+def _assert_expression(line: str) -> str:
+    """Return the tested expression of an ``assert``, dropping its message.
+
+    ``assert "train:" in compact, result.output`` reads raw output only in the
+    *failure message*, which is harmless and in fact good practice. Scanning the
+    whole line would flag it, so the top-level comma is found (ignoring commas
+    inside brackets or strings) and everything after it discarded.
+    """
+    depth = 0
+    quote = ""
+    for index, char in enumerate(line):
+        if quote:
+            if char == quote and line[index - 1 : index] != "\\":
+                quote = ""
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            return line[:index]
+    return line
+
+
+def _assert_statement_lines(tree: ast.AST) -> set[int]:
+    """Every line belonging to an `assert` statement, continuations included.
+
+    The scanner decides `is this an assertion?` from `stripped.startswith(
+    "assert")`, which is true of the first physical line only. Once the
+    formatter wraps a long assertion, the line that actually reads the output
+    is a continuation and was dropped one branch after the literal-skip rule.
+    Fixing only the skip rule moved the false negative rather than closing it,
+    which is why both are needed.
+    """
+    covered: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        # `node.test` ONLY, never `node.msg`. Reading raw output inside a
+        # failure message is harmless and in fact good practice --
+        # `_assert_expression` already drops it on a single-line assert, and
+        # taking the whole statement span here would re-introduce exactly that
+        # false positive one line lower, on the wrapped form. Measured: it
+        # flagged `test_recipes_v031.py:468`, a correct assertion, before this
+        # was narrowed.
+        test = node.test
+        covered.update(range(test.lineno, (test.end_lineno or test.lineno) + 1))
+    return covered
+
+
+def _multiline_literal_lines(tree: ast.AST) -> set[int]:
+    """Line numbers occupied by a string constant that spans several lines.
+
+    Those are this guard's own synthetic fixtures: adjacent string literals are
+    merged by the parser into ONE `ast.Constant`, so a fixture block written as
+    several quoted lines has `end_lineno > lineno` and is skipped whole.
+
+    A real assertion the formatter wrapped -- `assert (` on one line and
+    `"modality: text" in result.output` on the next -- carries only a
+    SINGLE-line constant, so it is not skipped. The rule this replaced skipped
+    any line beginning with a quote and could not tell the two apart, which
+    made exactly the shape ruff will eventually produce invisible (#635
+    follow-up, closed by the maintainer).
+    """
+    covered: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        end = node.end_lineno or node.lineno
+        if end > node.lineno:
+            covered.update(range(node.lineno, end + 1))
+    return covered
+
+
+def find_unsafe_highlighted_assertions(source: str) -> list[tuple[int, str]]:
+    """Return ``(lineno, text)`` for unnormalised reads of highlighted output.
+
+    Scoped per test FUNCTION, like ``find_raw_help_assertions``: a function that
+    invokes a syntax-highlighted command and then either feeds raw output to a
+    parser or asserts a multi-token substring against it.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # pragma: no cover — a broken file fails its own tests
+        return []
+    lines = source.splitlines()
+    literal_lines = _multiline_literal_lines(tree)
+    assert_lines = _assert_statement_lines(tree)
+    offenders: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test"):
+            continue
+        end = node.end_lineno or node.lineno
+        body = lines[node.lineno - 1 : end]
+        joined = "\n".join(body)
+        if not any(pattern.search(joined) for pattern in _HIGHLIGHTED_INVOCATIONS):
+            continue
+
+        tainted: set[str] = set()
+        for offset, line in enumerate(body):
+            stripped = line.strip()
+            if (node.lineno + offset) in literal_lines:
+                # Inside a MULTI-LINE string constant -- the synthetic fixtures
+                # this guard's own tests are built from. Scanning them would
+                # flag the examples written to prove the guard works. A
+                # single-line literal is deliberately NOT skipped, so a
+                # formatter-wrapped assertion stays visible.
+                continue
+            if _looks_normalised(stripped):
+                # Record that this variable is safe, then move on.
+                match = _ASSIGN_RE.match(line)
+                if match:
+                    tainted.discard(match.group(1))
+                continue
+
+            match = _ASSIGN_RE.match(line)
+            if match and not stripped.startswith("assert"):
+                name, rhs = match.group(1), match.group(2)
+                derived = _ANY_RAW_OUTPUT_RE.search(rhs) or any(
+                    re.search(rf"\b{re.escape(var)}\b", rhs) for var in tainted
+                )
+                if derived:
+                    tainted.add(name)
+                    if _PARSES_OUTPUT.search(rhs):
+                        offenders.append((node.lineno + offset, stripped[:100]))
+                continue
+
+            reads_raw = _ANY_RAW_OUTPUT_RE.search(stripped)
+            reads_tainted = any(
+                re.search(rf"\b{re.escape(var)}\b", stripped) for var in tainted
+            )
+            if not (reads_raw or reads_tainted):
+                continue
+            if _PARSES_OUTPUT.search(stripped):
+                offenders.append((node.lineno + offset, stripped[:100]))
+                continue
+            is_assert_head = stripped.startswith("assert")
+            if not (is_assert_head or (node.lineno + offset) in assert_lines):
+                continue
+            expression = (
+                _assert_expression(stripped) if is_assert_head else stripped
+            )
+            if not (
+                _ANY_RAW_OUTPUT_RE.search(expression)
+                or any(re.search(rf"\b{re.escape(var)}\b", expression) for var in tainted)
+            ):
+                continue
+            found = _STRING_LITERAL.search(expression)
+            literal = (found.group(1) or found.group(2)) if found else ""
+            if literal and _is_multi_token(literal):
+                offenders.append((node.lineno + offset, stripped[:100]))
+    return offenders

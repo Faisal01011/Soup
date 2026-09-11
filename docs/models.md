@@ -43,6 +43,28 @@ whose `scatter` operator still requires `int64` indices, Soup widens only the
 QSA indexer's local index tensors before LoRA injection; Torch and the upstream
 Transformers class remain unchanged.
 
+With `training.stream_layers: true`, the Qwen4-Exp text decoder is admitted by
+its own parity-tested path. Its very large frozen PLE N-gram table is excluded
+from the decoder-layer shard and can be served from the original safetensors
+with `training.stream_ngram_source: disk`. Reads are sparse and read-only; Soup
+does not create a second dense PLE copy in its shard cache.
+
+Dense Transformers checkpoints and oMLX/oQ affine Qwen4 bundles are accepted by
+this layer-streamed SFT path. For oQ, Soup dequantizes each frozen decoder layer
+into the reusable stream cache and maps the fused Switch-MLP expert tensors to
+the Transformers text decoder. The packed PLE table remains in the original
+checkpoint and only selected rows are dequantized, so oQ requires
+`stream_ngram_source: disk` (or `auto`). Vision-tower and MTP weights are not
+part of the text-only CausalLM and are ignored. `training.quantization` must
+remain `none`; streamed NF4 parity is separate and is not validated for Qwen4.
+
+The Qwen4 resident-versus-streamed parity oracle currently covers float32 CPU.
+BF16 parity on CUDA has not been measured, so CUDA BF16 production readiness is
+still pending even though the runtime selects BF16 there. The 176.9B-parameter
+production oQ checkpoint completed cache construction and training setup on an
+M4 Max but not a full optimizer step; it is not validated as trainable on a
+128 GiB Mac. See the [M4 Max gate record](../benchmarks/gate-qwen4-ple-m4-max.md).
+
 ### Vision Models (with `modality: vision`)
 
 | Model | Size | Supported Formats |
@@ -103,6 +125,11 @@ wrong with the package. (Dropping the quotes entirely works on Windows too, but 
 
 The core `pip install soup-cli` is a light install — the CLI, config system, and data tools, with
 no PyTorch. Add `[train]` to fine-tune, or install other extras only when you need them:
+
+Every row below is written with `pip`, and works verbatim inside a virtualenv, a Colab notebook
+or a Docker image. Outside one, on Debian 12 / Ubuntu 23.04 or later, `pip` refuses with
+`error: externally-managed-environment`; substitute `pipx` or `uv tool` for `pip` and the extras
+spelling is unchanged. See [the README's install section](../README.md#1-install).
 
 | Extra | Install | What it adds |
 |---|---|---|

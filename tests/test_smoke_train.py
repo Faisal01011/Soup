@@ -69,7 +69,13 @@ def tiny_dpo_data(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def sft_config_yaml(tmp_path: Path, tiny_train_data: Path) -> Path:
-    """Create a minimal SFT config for smoke testing with tiny-gpt2."""
+    """Create a minimal SFT config for smoke testing with tiny-gpt2.
+
+    ``chat_template`` is set even though ``format`` already says chatml: the
+    two are separate fields, and tiny-gpt2 ships no template of its own. Since
+    v0.36.0 the missing-template case is a hard error rather than the silent
+    ``f"{role}: {content}"`` fallback that produced wrong loss labels.
+    """
     config_path = tmp_path / "soup.yaml"
     output_dir = tmp_path / "output"
     config_path.write_text(
@@ -79,6 +85,7 @@ task: sft
 data:
   train: {tiny_train_data}
   format: chatml
+  chat_template: chatml
   val_split: 0.0
   max_length: 128
 
@@ -101,13 +108,18 @@ output: {output_dir}
     return config_path
 
 
+#: The base the MLX smoke fixture trains. Named once so the fixture and the
+#: adapter-loadability assertion cannot drift onto different models.
+_MLX_SMOKE_BASE = "hf-internal-testing/tiny-random-LlamaForCausalLM"
+
+
 @pytest.fixture
 def mlx_sft_config_yaml(tmp_path: Path, tiny_train_data: Path) -> Path:
     """Create a one-step MLX SFT config with a public tiny Llama fixture."""
     config_path = tmp_path / "soup_mlx.yaml"
     output_dir = tmp_path / "output_mlx"
     config_path.write_text(
-        f"""base: hf-internal-testing/tiny-random-LlamaForCausalLM
+        f"""base: {_MLX_SMOKE_BASE}
 task: sft
 backend: mlx
 
@@ -227,6 +239,32 @@ def test_mlx_sft_smoke(mlx_sft_config_yaml: Path):
     output_dir = mlx_sft_config_yaml.parent / "output_mlx"
     assert (output_dir / "adapters.safetensors").exists()
     assert (output_dir / "adapter_config.json").exists()
+
+    # #23's "adapter file saved and loadable" criterion. Existence is not
+    # loadability, and the gap has a named failure mode here: per
+    # `resolve_mlx_target_keys`'s docstring (#392), a run could ship
+    # `{"keys": ["auto"]}`, `linear_to_lora_layers` would match nothing, and
+    # `load_weights(strict=False)` would drop every LoRA tensor IN SILENCE --
+    # leaving an adapter that exists, satisfies both assertions above, and
+    # produces generations bit-identical to the base model.
+    #
+    # So the check is that loading ATTACHES LoRA parameters, not merely that
+    # it does not raise. A dropped-tensor adapter loads perfectly happily.
+    from mlx.utils import tree_flatten
+    from mlx_lm import load
+
+    base_model, _ = load(_MLX_SMOKE_BASE)
+    tuned_model, _ = load(_MLX_SMOKE_BASE, adapter_path=str(output_dir))
+
+    base_keys = {key for key, _ in tree_flatten(base_model.parameters())}
+    tuned_keys = {key for key, _ in tree_flatten(tuned_model.parameters())}
+    lora_keys = {key for key in tuned_keys - base_keys if ".lora_" in key}
+
+    assert lora_keys, (
+        "the adapter loaded but attached no LoRA parameters: "
+        f"{len(base_keys)} params before, {len(tuned_keys)} after. That is the "
+        "#392 shape -- an adapter that exists and is inert."
+    )
 
 
 def test_dpo_smoke(dpo_config_yaml: Path):

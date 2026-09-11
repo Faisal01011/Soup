@@ -10,6 +10,8 @@ import math
 
 import pytest
 
+from tests._windows_ci import skip_on_windows_ci
+
 # Skip the whole module when torch is unavailable — the math kernels are
 # torch-based by design.
 torch = pytest.importorskip("torch")
@@ -74,6 +76,64 @@ class TestGRPOVariantKernels:
 
         logp_new, logp_old, adv = self._toy_inputs()
         mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+        out = apply_variant_loss(
+            "gspo",
+            logp_new=logp_new,
+            logp_old=logp_old,
+            advantages=adv,
+            completion_mask=mask,
+        )
+        assert math.isfinite(float(out))
+
+    def test_gspo_masked_token_cannot_change_loss(self):
+        """A masked (padding) token must not shift the gspo batch-mean
+        statistic other rows are centered against (#723)."""
+        from soup_cli.utils.grpo_variants import apply_variant_loss
+
+        logp_old = torch.zeros(4, 2)
+        adv = torch.tensor([1.0, 0.6, -0.3, 0.2])
+        mask = torch.tensor([[1.0, 0.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]])
+
+        losses = []
+        for delta in (-2.0, -6.0):
+            logp_new = torch.zeros(4, 2)
+            logp_new[0, 1] = delta  # masked position
+            out = apply_variant_loss(
+                "gspo",
+                logp_new=logp_new,
+                logp_old=logp_old,
+                advantages=adv,
+                completion_mask=mask,
+            )
+            losses.append(float(out))
+        assert losses[0] == pytest.approx(losses[1])
+
+    def test_gspo_masked_token_zero_gradient(self):
+        """Every masked gspo token must receive exactly zero gradient (#723)."""
+        from soup_cli.utils.grpo_variants import apply_variant_loss
+
+        logp_old = torch.zeros(4, 2)
+        adv = torch.tensor([1.0, 0.6, -0.3, 0.2])
+        mask = torch.tensor([[1.0, 0.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]])
+        logp_new = torch.zeros(4, 2, requires_grad=True)
+        with torch.no_grad():
+            logp_new[0, 1] = -6.0
+        out = apply_variant_loss(
+            "gspo",
+            logp_new=logp_new,
+            logp_old=logp_old,
+            advantages=adv,
+            completion_mask=mask,
+        )
+        out.backward()
+        assert float(logp_new.grad[0, 1]) == pytest.approx(0.0)
+
+    def test_gspo_all_masked_column_no_nan(self):
+        """A column with zero unmasked entries must not divide by zero."""
+        from soup_cli.utils.grpo_variants import apply_variant_loss
+
+        logp_new, logp_old, adv = self._toy_inputs()
+        mask = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
         out = apply_variant_loss(
             "gspo",
             logp_new=logp_new,
@@ -686,6 +746,7 @@ class TestGRPOVariantRuntimeContract:
         # rft computes NLL on positive advantages whereas gspo uses centered ratio
         assert losses["rft"] != losses["gspo"]
 
+    @skip_on_windows_ci
     def test_real_trl_grpotrainer_end_to_end_step(self, tmp_path):
         """End-to-end single step with real trl.GRPOTrainer and tiny model."""
         from datasets import Dataset

@@ -115,6 +115,36 @@ training:
 
 MLX backend supports SFT. `backend: mlx` with `task: dpo` or `task: grpo` is refused when the config is loaded, with an error naming the task — upstream `mlx-lm` ships no DPO/GRPO training helper, so those wrappers exist only as a backstop for callers that bypass config validation. Requires `mlx-lm >= 0.31.3`. Use `soup recipes search --tag mlx` for ready-made Apple Silicon configs.
 
+#### Optimizers and schedules
+
+`training.optimizer`, `training.scheduler`, `training.warmup_ratio` and
+`training.weight_decay` are honoured on the MLX backend
+([#686](https://github.com/MakazhanAlpamys/Soup/issues/686)). Before that they
+were validated, accepted and dropped — every run built a bare AdamW at a
+constant learning rate, whatever the recipe said.
+
+Because they are honoured rather than ignored, a setting MLX cannot express is
+now **refused when the optimizer is built**, rather than silently substituted:
+
+| setting | MLX accepts | otherwise |
+|---|---|---|
+| `optimizer` | `adamw_torch`, `adamw_hf`, `adamw_torch_fused`, `sgd`, `adafactor`, `adagrad`, `rmsprop`, `muon` | refused by name, listing what is available |
+| `scheduler` | `cosine`, `linear`, `constant`, `constant_with_warmup` | refused, naming the old constant-rate behaviour |
+| `weight_decay` | any value on every optimizer above except `adagrad` and `rmsprop` | a non-zero value on `adagrad` / `rmsprop` is refused — those MLX constructors take no `weight_decay`, and dropping it silently is the defect above |
+
+Soup's optimizer allowlist (`utils.optimizer_zoo`) is far wider than anything
+MLX ships, so most valid values have no MLX equivalent. Run those recipes on
+the transformers backend.
+
+The schedule counts **optimizer updates**, not iterations: mlx-lm calls
+`optimizer.update()` once every `gradient_accumulation_steps`, so a warmup of
+`warmup_ratio × (iters // gradient_accumulation_steps)` is what actually runs.
+The effective plan is written to `adapter_config.json` (`optimizer`,
+`scheduler`, `warmup_updates`, `total_updates`, `weight_decay`, `peak_lr`), so
+what ran is recoverable from the output directory.
+
+`--resume auto` finds mlx-lm's step-numbered `NNNNNNN_adapters.safetensors` checkpoints and warm-starts the LoRA weights from them ([#634](https://github.com/MakazhanAlpamys/Soup/issues/634)). This restores adapter weights only, not training state: mlx-lm's LoRA trainer exposes no optimizer state or step count, so training restarts from step 0 regardless of how far the checkpoint got. See [Resume Training](#resume-training) below for the MLX-specific checkpoint shape.
+
 ### Transformers on MPS
 
 The regular `backend: transformers` path can run more than MLX's SFT-only
@@ -170,11 +200,11 @@ Works with all training tasks: SFT, DPO, GRPO, PPO, KTO, ORPO, SimPO, IPO, and P
 > **Tip:** Soup auto-detects unsloth. When installed, you'll see a hint during `soup train` if you haven't enabled it yet.
 
 
-## Cloud GPU Training (Modal)
+## Cloud GPU Training
 
-No local GPU? `soup train --cloud modal` renders a self-contained [Modal.com](https://modal.com)
-app from your `soup.yaml` for serverless, per-second-billed GPU training. The config YAML is
-base64-embedded as **data** — no code interpolation, no secrets in the generated stub.
+No local GPU? `soup train --cloud modal|lambda` renders a provider-specific controller
+from your `soup.yaml`. The config YAML is base64-embedded as **data**; credentials are read from
+the environment only when a live submission starts.
 
 ```bash
 pip install "soup-cli[modal]"   # only needed for live submit
@@ -190,6 +220,37 @@ soup train --config soup.yaml --cloud modal --gpu a100 --cloud-submit
 `--gpu` accepts: `t4` / `l4` / `a10g` / `a100` / `a100-80gb` / `l40s` / `h100`. The rendered
 `soup_modal_app.py` builds an image with `soup-cli[train]` pinned to your running version, writes
 the embedded config inside the container, and runs `soup train` on the chosen GPU.
+
+### RunPod (Planned)
+
+RunPod support is currently in development and descoped from live CLI dispatch pending automated
+lifecycle and termination safeguards. Running `soup train --cloud runpod` informs the operator that
+RunPod is not yet live and points to active cloud backends (`--cloud modal` and `--cloud lambda`).
+
+### Lambda Cloud
+
+Lambda uses an instance rather than a serverless function. The generated local controller sends a
+secret-free cloud-init script as API `user_data`, waits for it over SSH, copies the configured
+output back, and requests instance termination in a `finally` block. Keep the controller running
+until it reports that termination succeeded; shutting down the guest does not terminate billing.
+
+Register the public half of an SSH key with Lambda first, then set:
+
+```bash
+export LAMBDA_API_KEY=...
+export LAMBDA_SSH_KEY_NAME=my-lambda-key
+export LAMBDA_SSH_PRIVATE_KEY=/path/to/private-key
+export LAMBDA_REGION=us-tx-1  # optional; defaults to us-tx-1
+soup train --config soup.yaml --cloud lambda --gpu a100 --cloud-submit
+```
+
+`--gpu` accepts: `a10` / `a100` / `a6000` / `h100`. Lambda output paths must be relative so the
+controller can copy the artifact back safely. The API key stays on the caller and is never embedded
+in cloud-init or instance logs.
+
+The Lambda submission path still requires the paid live-validation checklist in #264 before
+it can be described as provider-validated. Plan-only rendering and the lifecycle boundaries are
+covered by offline tests.
 
 
 ## Chat with your model
@@ -282,6 +343,15 @@ soup train --config soup.yaml --resume auto
 # Resume from a specific checkpoint
 soup train --config soup.yaml --resume ./output/checkpoint-500
 ```
+
+`backend: mlx` writes and resumes a different checkpoint shape: a
+step-numbered `NNNNNNN_adapters.safetensors` file (or the final
+`adapters.safetensors`) directly under `output`, not a `checkpoint-N`
+directory. `--resume auto` and `--resume ./output/0011800_adapters.safetensors`
+both work; `--resume ./output/checkpoint-500` does not, because MLX never
+writes that shape. This is a weights-only warm start — mlx-lm's LoRA trainer
+exposes no optimizer state or step count, so the resumed run starts counting
+from step 0 regardless of how far the checkpoint got.
 
 
 ## Run Management & Cleanup
@@ -404,7 +474,9 @@ soup sweep --config soup.yaml --param lr=1e-5,2e-5,5e-5 --param lora_r=8,16,32
 # Random search with max runs
 soup sweep --config soup.yaml --param lr=1e-5,2e-5,5e-5 --strategy random --max-runs 5
 
-# Preview without running
+# Preview without running — validates first (#642): unknown config keys emit
+# the same warning block `train --dry-run` does, and a --param naming no config
+# field exits non-zero before any grid is printed
 soup sweep --config soup.yaml --param lr=1e-5,2e-5 --param epochs=2,3 --dry-run
 
 # Early stopping: skip remaining runs if loss exceeds 1.5x best
@@ -490,6 +562,50 @@ soup --verbose eval --model ./output --benchmarks mmlu
 > **Note:** `--verbose` is a global flag — it must go **before** the command name, not after.
 
 
+## Unknown config keys
+
+Every config model used to run with Pydantic's default `extra="ignore"`, so a key the
+schema did not declare was dropped without a word. `soup train --dry-run` printed
+"Config valid. Ready to train!", the run exited 0, and the requested setting was simply
+never applied — `quantizaton: none` trained 4-bit quantized when full precision was
+what you asked for, `gradient_checkpoint: true` did no checkpointing, `max_len: 512`
+truncated at 2048.
+
+Loading a config now reports every key it cannot place, in **one** report per load, with
+the field you probably meant:
+
+```
+Warning: unknown config key 'data.max_len' - did you mean 'max_length' or 'video_maxlen'? Not applied.
+unknown config key 'training.quantizaton' - did you mean 'quantization' or 'quantization_aware'? Not applied.
+Soup v0.75 will reject unknown config keys instead of warning.
+```
+
+**The deadline is real: v0.75 refuses to load a config with an unknown key.** The
+warning ships in v0.74 and the refusal one minor later, so there is exactly one release
+of notice — deliberately, because a config written against a newer Soup has to keep
+running on an older wheel for at least one release. Until v0.75 the key is ignored, not
+defaulted, and the run proceeds as if you had not written it. Treat the warning as work
+to do, not as a note.
+
+A config that names a key your installed Soup does not have usually means one of two
+things: a typo (take the suggestion), or a field added after your version shipped
+(`soup version` against the [changelog](../CHANGELOG.md) will say which).
+
+**`soup sweep` is stricter, and has no deadline.** A `--param` that matches no config
+field is a hard error from this release, not in v0.75:
+
+```bash
+soup sweep --config soup.yaml --param lora_rank=8,16   # the field is training.lora.r
+# sweep parameter does not match any config field: unknown config key 'lora_rank' - not applied.
+echo $?   # 1
+```
+
+The whole sweep is refused before the first arm starts, and the command exits non-zero, so
+a scripted or CI-driven sweep fails rather than reporting a grid of arms that each failed
+for the same reason. A sweep whose swept knob is never applied produces arms that are all
+identical, so there is no partially-useful result to preserve by continuing.
+
+
 ## Experiment Tracking
 
 Every `soup train` run is automatically tracked in a local SQLite database (`~/.soup/experiments.db`).
@@ -545,15 +661,25 @@ pip install mlflow      # or: swanlab / trackio
 ### Telemetry (opt-in)
 
 Soup ships a hardware-info-only telemetry payload (Soup version + command +
-Python major.minor + OS + arch + duration). It is **off by default** and never
-sends model names, dataset paths, or config contents. Enable explicitly:
+Python major.minor + OS + arch + duration + anonymous distinct ID). It is **off by default** and never
+sends model names, dataset paths, or config contents.
+
+To opt in, set the environment variable:
 
 ```bash
 SOUP_TELEMETRY=1 soup train --config soup.yaml
 ```
 
-The PostHog network upload itself is deferred to v0.43.1; v0.43.0 ships the
-payload schema only so you can audit it before opting in.
+When `SOUP_TELEMETRY` is unset, `0`, or any value other than `1`/`true`/`yes`/`on`, Soup performs
+zero telemetry network requests.
+
+You can also explicitly disable telemetry for a specific invocation using the `--no-telemetry` flag:
+
+```bash
+soup train --config soup.yaml --no-telemetry
+```
+
+When enabled, telemetry performs a synchronous fire-and-forget HTTP POST with a 1-second connect and read timeout (DNS resolution excluded) on command exit. The anonymous identifier is stored at `~/.soup/telemetry_id`; deleting `~/.soup/telemetry_id` regenerates it on the next opt-in. See [Privacy Policy](#privacy-policy) for details.
 
 
 ## Profiling Extras
@@ -787,9 +913,30 @@ pip install soup-cli[trackers]   # mlflow + swanlab + trackio
 ```
 
 
-## Telemetry (not yet wired)
+## Telemetry & Privacy Policy
 
-Soup contains opt-in, hardware-info-only telemetry primitives in `utils/trackers.py` (`build_telemetry_payload` / `send_telemetry_payload`), but they are **not wired to any command** — no data is ever sent, and no environment variable enables sending today. When wired, the payload will carry only `soup_version` / `command` / `python` major.minor / `os` / `arch` / optional `duration_seconds` — never dataset paths, model names, or config contents — behind a 1-second hard timeout and the same HTTPS-only, private-IP-rejecting SSRF policy as hub endpoints, swallowing every exception so telemetry can never crash training. Wiring is deferred until a public privacy policy is published.
+Soup contains opt-in, hardware-info-only telemetry in `utils/trackers.py` (`build_telemetry_payload` / `send_telemetry_payload`).
+
+### Privacy Policy
+
+Soup's telemetry is strictly anonymous and hardware-focused. When opted in via `SOUP_TELEMETRY=1`, we collect only the following fields to understand what environments we need to support:
+
+- `soup_version`: the version of Soup being run
+- `command`: the top-level command executed (e.g. `train`, `data`, validated against known commands; unknown commands or paths are masked as `(unknown)`)
+- `python`: Python major.minor version
+- `os`: OS platform name (`platform.system()`)
+- `arch`: System architecture (`platform.machine()`)
+- `duration_seconds`: Command execution duration in seconds
+- `distinct_id`: Anonymous UUID4 generated locally on first run and stored at `~/.soup/telemetry_id` to deduplicate events. Deleting `~/.soup/telemetry_id` regenerates it on the next opt-in.
+
+We **NEVER** collect:
+- Dataset paths or contents
+- Model names or architectures
+- Config file contents or hyperparameters
+- Usernames, local file paths, or directory names
+- IP addresses, tokens, or credentials
+
+All uploads use HTTPS, a 1-second connect and read timeout (DNS resolution excluded), and defensive SSRF validation. Any network or filesystem exception is silently swallowed so telemetry can never fail or interrupt your work.
 
 
 ## Plugin System
@@ -966,3 +1113,14 @@ soup license-advisor --target b2c --license llama-3 --monthly-active-users 80000
 ```
 
 The Llama-family allowlist is tight (no `.startswith` over-match), so a hypothetical future `llama-permissive-2030` won't false-trigger the 700M-MAU gate. Composes with v0.60 `soup adapters merge --license <id>` for the merge-time conflict gate.
+
+## Troubleshooting
+
+```bash
+soup doctor    # GPU, system resources, dependencies, and version in one place
+```
+
+- **`ImportError: DLL load failed while importing _C` (Windows).** PyPI's torch
+  wheel is CPU-only. Reinstall a CUDA build; `soup doctor` prints the
+  `pip install` command for the wheel your driver can run.
+- **`soup version` ≠ `pip show soup-cli`** — multiple Python installs; use a virtualenv.

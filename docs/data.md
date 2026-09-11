@@ -241,7 +241,38 @@ closed. It does not construct a sampler or judge. SFT and DPO rows retain the
 candidate-artifact and judgment-file digests, group id, public sampler settings,
 and bounded verifier identity. Endpoint URLs and local model paths are never
 copied into those artifacts. Reusing the same two input files produces identical
-training-row bytes.
+training-row bytes. The offline command writes `<output>.manifest.json` last (or
+the explicit `--manifest` path) and binds the exact SFT/DPO hashes, row counts,
+candidate artifact, judgment file, and whether DPO output was requested. Treat
+the manifest as the commit marker: missing or mismatched manifests identify an
+interrupted or replaced generation.
+
+The candidate artifact and verified judgment file are the durable recovery
+boundary for offline materialization. This phase performs no sampling, so it has
+no progress checkpoint: `--resume` and `--checkpoint` are rejected. After any
+late write failure, keep those two inputs and rerun the exact offline command.
+Soup removes the previous manifest before replacing outputs and publishes the
+new manifest last. A prior, manifest-authenticated DPO beside the manifest is
+removed when the replacement run requests SFT only.
+
+Consumers must verify the final manifest and open exactly the SFT/DPO files it
+lists. They must never discover training inputs by globbing neighboring JSONL
+files: an unlisted sidecar, including an older DPO stored elsewhere, is not part
+of the committed generation.
+
+Candidate export durably checkpoints each completed prompt group at
+`<artifact>.checkpoint.jsonl`. If sampling stops, rerun the same command with
+`--resume`; Soup authenticates the checkpoint against the prompts and sampler
+before continuing at the first incomplete group. Candidate and judgment inputs
+are validated through a temporary disk index, and final SFT/DPO files are staged
+incrementally, so memory does not grow with the complete artifact size.
+For a local model directory, the checkpoint binds the exact regular-file names,
+sizes, and contents through a privacy-safe fingerprint; replacing weights at the
+same path therefore invalidates resume before the model is loaded. Prompt source
+lines and provider endpoints are bound as well without exposing private paths or
+URLs. Streamed SFT/DPO replacements are committed as one rollback-protected set,
+and an SFT-only replacement retires a prior manifest-bound DPO in that same
+transaction.
 
 ### Custom Transforms
 
@@ -282,7 +313,26 @@ soup ingest --source otel         --logs ./otel-spans.jsonl
 soup ingest --source openai-stored --logs ./oai-stored-completions.jsonl
 ```
 
-The CLI never makes the network call — operators export from their SaaS dashboard or vendor API, then point `soup ingest` at the local file. Auth env vars (`LANGFUSE_KEY` / `LANGSMITH_API_KEY` / `HELICONE_API_KEY` / `OPENPIPE_API_KEY` / `OPENAI_API_KEY` / `OTEL_EXPORTER_OTLP_HEADERS`) are advisory only — Soup surfaces which one is unset so operators wire creds before the SaaS-side export. A PII reminder fires on every ingest run (matches v0.26.0 Trace-to-Preference policy).
+With `--logs` the CLI never makes a network call — operators export from their SaaS dashboard or vendor API, then point `soup ingest` at the local file. Auth env vars (`LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` / `LANGSMITH_API_KEY` / `HELICONE_API_KEY` / `OPENPIPE_API_KEY` / `OPENAI_API_KEY` / `OTEL_EXPORTER_OTLP_HEADERS`) are advisory on that path — Soup surfaces which ones authenticate the source. A PII reminder fires on every ingest run (matches v0.26.0 Trace-to-Preference policy).
+
+### Live pull from Langfuse (`--pull`, #204)
+
+Langfuse is the one source Soup can fetch directly, so there is no export step:
+
+```bash
+export LANGFUSE_PUBLIC_KEY=pk-lf-...   # Project Settings -> API Keys
+export LANGFUSE_SECRET_KEY=sk-lf-...
+export LANGFUSE_HOST=https://us.cloud.langfuse.com   # optional: default is https://cloud.langfuse.com
+soup ingest --source langfuse --pull --since 7d --output traces.jsonl
+```
+
+- **What one row is.** One output row per `GENERATION` observation in the window — the unit that carries a model, the exact input it was given and the output it produced — read from Langfuse's Observations API v2 (`/api/public/traces` is removed from Langfuse Cloud on 2026-11-16). A row's `trace_id` is the observation id. The API returns plain-text input and output as-is but structured values (chat message lists, objects) as JSON inside a string; those are decoded, and a chat message list becomes a `prompt` of every message's content joined by newlines (system prompt included), the same flattening `parse_langfuse` applies to a `{"messages": [...]}` export. An agent trace therefore yields one row per LLM call it made; its spans and tool calls yield none. Generations with no input or no output are skipped and counted in the summary line, so a pull that matched nothing usable says so instead of writing an empty file silently.
+- **Credentials.** Read from the environment only, never from a flag, so they never reach the audit log's argv. `LANGFUSE_BASE_URL` is honoured before `LANGFUSE_HOST`, the same precedence as the Langfuse SDK. The key pair is not written to the output, the console, debug logs or error messages.
+- **Host checks.** HTTPS only. The host goes through the same SSRF validator as `--slack-url`; a private, link-local or loopback address (self-hosted Langfuse) additionally needs `--allow-private-host`. Redirects are refused rather than followed with credentials attached.
+- **Bounds.** `--since` accepts `30m` / `24h` / `7d` up to `365d` (default `7d`). Each request times out after 30 s and a response is capped at 64 MiB. Pages hold 100 generations; if results are still pending after `--max-pages` pages (default 100, max 10 000), the command stops with exit 1 and writes nothing — the output streams to a staging file, so an earlier file at `--output` is left untouched. HTTP 429 is retried up to 5 times, honouring `Retry-After` with a 60 s ceiling.
+- **Without `--pull`** nothing changes: the pull code is not imported and no connection is opened.
+
+The other sources have no live pull yet — export them and pass `--logs`.
 
 
 ## Prompt Mining (`soup prune-prompt`)
@@ -568,6 +618,11 @@ data:
   shards: 4
 ```
 
+**HuggingFace Hub names** (a single `data.train` like `org/dataset`): `data.streaming: true`
+is forwarded to `datasets.load_dataset(..., streaming=True)` and `buffer_size` shuffles
+that stream, then Soup materialises up to 1M rows — the same shape as remote (#689).
+An all-hub *list* with `streaming: true` is still refused (#459). `buffer_size` shuffles the train split only; a capped validation split takes the first N rows unshuffled.
+
 **Multi-dataset interleave** (v0.42.0 schema, wired into training-time loading in #443;
 extended to streaming and HF-hub dataset names in #459):
 
@@ -610,8 +665,9 @@ than silently falling through to local/hub classification:
   differently-shaped hub datasets through their own split negotiation is unimplemented and
   refuses at parse time, by name). A hub entry's own `validation` split is used for the
   combined val set **only when every entry provides one** (combined the same way); if only
-  some entries provide one it is ignored (warned) and `data.val_split` applies to the
-  combined train rows instead — a partial hub split is not a decided mixture.
+  some entries provide one it is ignored (warned) and `data.val_split` is derived instead:
+  per source before `over`/`probs` pad it, same as the local-file path below, or from the
+  combined train rows for `concat`/`under`. A partial hub split is not a decided mixture.
 - **A mix of hub names with local/remote entries in the same list** always refuses — there
   is no decided answer for how a hub split and a local file's row count should reconcile.
 
@@ -624,6 +680,26 @@ not byte-identically (a streaming source's size generally can't be known ahead o
 | `under`  | truncate every source to the smallest source's size | `interleave_datasets(streams, stopping_strategy="first_exhausted")`       |
 | `over`   | upsample every source to the largest source's size (cycled) | `interleave_datasets(streams, stopping_strategy="all_exhausted")` |
 | `probs`  | exact apportionment to the requested ratio        | `interleave_datasets(streams, probabilities=probs, stopping_strategy="first_exhausted")` — converges to the same ratio, sampled rather than exact |
+
+On the local (eager) and all-hub-name paths, `data.val_split` is applied per source before
+`over`/`probs` pad it with copies of its own rows, so a padded row can never land on both
+sides of the split; `concat`/`under` never duplicate rows and still split the combined
+result as before. This does not reach the streaming path below, which still splits after
+combining and can still duplicate a row across `train` and `val` under `over`/`probs`.
+
+Splitting before padding also means the requested `val_split` fraction is no longer exact
+under `over`/`probs`: it is taken from each source's own (smaller, unpadded) row count, so
+the held-out share of the final, padded total comes out lower than requested. For example,
+two sources of 1000 and 100 rows with `over` and `val_split: 0.1` yield 110 val rows out of
+1910 total (5.8%), not the 200/2000 (10%) a single-source split would give. `concat`/`under`
+are unaffected (they never pad). This is the trade-off for closing the duplicate-row leak,
+not a separate bug: holding out an exact 10% of the padded total would mean some val rows
+are copies of val rows already counted, or of train rows.
+
+Train and val also end up with different source mixtures once `over`/`probs` pads: val is
+carved from each source's original, unpadded rows, while train sees the padded, rebalanced
+mix. Anyone who oversampled specifically to correct a source imbalance gets a validation set
+that still reflects the original, un-rebalanced skew, not the mixture train now trains on.
 
 **Vocab expansion + advanced masking:**
 
@@ -680,6 +756,9 @@ soup data inspect ./data/train.jsonl
 soup data validate ./data/train.jsonl
 soup data validate ./data/train.jsonl --format alpaca
 
+# Require at least 90% of rows to be usable
+soup data validate ./data/train.jsonl --min-valid-fraction 0.9
+
 # Convert between formats
 soup data convert ./data/train.jsonl --to sharegpt --output converted.jsonl
 
@@ -697,6 +776,12 @@ soup data filter ./data/train.jsonl --coherence 0.3
 soup data filter ./data/train.jsonl --perplexity 500 --coherence 0.3
 soup data filter ./data/train.jsonl --score-only  # add scores without filtering
 ```
+
+`soup data validate` exits with code `0` when at least one row is usable and the
+optional minimum valid fraction is met. It exits with code `1` for input errors,
+such as a missing file or an undetectable format, and code `2` when a non-empty
+dataset has no usable rows or falls below `--min-valid-fraction`. A partially valid
+dataset still exits with code `0` when no minimum is specified.
 
 
 ## Demo Datasets (`soup data demo`)

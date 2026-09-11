@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -305,19 +306,17 @@ def serve(
     ),
 ):
     """Start a local inference server with OpenAI-compatible API."""
-    # Security: the transformers backend exposes a best-effort code-exec tool
-    # endpoint (/v1/tools/python). Binding a non-loopback host without a tool
-    # auth token puts that endpoint on the network unauthenticated.
+    # Security: the server exposes code-exec tool endpoints (/v1/tools/python, /v1/tools/bash).
+    # Binding a non-loopback host without a tool auth token exposes unauthenticated code execution.
     if host not in {"127.0.0.1", "localhost", "::1"} and not tool_auth_token:
         from rich.markup import escape as _rich_escape
 
         console.print(
-            f"[bold yellow]Security warning:[/] binding non-loopback host "
-            f"'{_rich_escape(str(host))}' exposes the unauthenticated code-exec "
-            "tool endpoint (/v1/tools/python) to the network. Pass "
-            "[bold]--tool-auth-token <secret>[/] to require a bearer token, or "
-            "use [bold]--host 127.0.0.1[/] (the default)."
+            f"[red]Error:[/] binding non-loopback host '{_rich_escape(str(host))}' "
+            "requires [bold]--tool-auth-token <secret>[/] to protect code-execution "
+            "tool endpoints (/v1/tools/bash, /v1/tools/python)."
         )
+        raise typer.Exit(code=2)
     # v0.71.12 #221 — validate `--bank` up front (path containment + backend)
     # so a typo / bad path surfaces before backend init.
     if bank is not None:
@@ -535,7 +534,32 @@ def serve(
             raise typer.Exit(1) from exc
 
         mii_model_name = Path(model).name
-        mii_app = build_mii_app(mii_pipeline, model_name=mii_model_name)
+
+        # #332 — the served model's own chat template, same as the vLLM path.
+        # Without this the MII backend feeds a chat-tuned model a prompt format
+        # it never trained on, which is what made Llama-3.1-8B run on.
+        mii_tokenizer = _load_serve_tokenizer(
+            model_path=Path(model),
+            base_model=None,
+            trust_remote_code=trust_remote_code,
+        )
+        if mii_tokenizer is None:
+            console.print(
+                "[yellow]Warning:[/] no tokenizer could be loaded for this model — "
+                "falling back to a generic 'User:/Assistant:' prompt. Chat-tuned "
+                "models can run on past their stop token with this format."
+            )
+        elif not getattr(mii_tokenizer, "chat_template", None):
+            console.print(
+                "[yellow]Warning:[/] this model ships no chat template — using the "
+                "generic 'User:/Assistant:' prompt format."
+            )
+        else:
+            console.print("[green]Chat template:[/] applying the model's own template.")
+
+        mii_app = build_mii_app(
+            mii_pipeline, model_name=mii_model_name, tokenizer=mii_tokenizer,
+        )
 
         import uvicorn
         console.print(
@@ -819,6 +843,7 @@ def serve(
             max_tokens_default=max_tokens_default,
             tensor_parallel=tensor_parallel,
             gpu_memory_utilization=gpu_memory_utilization,
+            trust_remote_code=resolved_trust,
         )
     else:
         # Transformers backend (original). ``resolved_trust`` was computed
@@ -1100,6 +1125,7 @@ def serve(
             reasoning_parser=resolved_reasoning_parser,
             record_thumbs_db=record_thumbs_db,
             auth_token=tool_auth_token,
+            host=host,
             loaded_bank=loaded_bank,
             mole_runtime=mole_runtime,
             kv_cache_generate_kwargs=(
@@ -1253,21 +1279,34 @@ def _serve_sglang(
     max_tokens_default: int,
     tensor_parallel: int,
     gpu_memory_utilization: float,
+    trust_remote_code: bool = False,
 ):
     """Set up SGLang runtime and create FastAPI app."""
     from soup_cli.utils.sglang import create_sglang_app, create_sglang_runtime
 
-    console.print(
-        Panel(
-            f"[bold yellow]WARNING:[/] Loading model via SGLang: "
-            f"[bold]{model_path}[/]\n"
-            "SGLang loads models with trust_remote_code enabled.\n"
-            "If this model contains custom code, it will execute "
-            "on this machine.\nOnly use models you trust.",
-            title="SGLang Runtime",
-            border_style="yellow",
+    if trust_remote_code:
+        console.print(
+            Panel(
+                f"[bold yellow]WARNING:[/] Loading model via SGLang: "
+                f"[bold]{model_path}[/]\n"
+                "trust_remote_code is ENABLED for this run.\n"
+                "If this model contains custom code, it will execute "
+                "on this machine.\nOnly use models you trust.",
+                title="SGLang Runtime",
+                border_style="yellow",
+            )
         )
-    )
+    else:
+        console.print(
+            Panel(
+                f"Loading model via SGLang: [bold]{model_path}[/]\n"
+                "trust_remote_code is disabled (default). A model that needs "
+                "custom code\nwill fail to load -- re-run with "
+                "--trust-remote-code if you trust the source.",
+                title="SGLang Runtime",
+                border_style="cyan",
+            )
+        )
     console.print("[dim]Initializing SGLang runtime...[/]")
     runtime, runtime_model_name = create_sglang_runtime(
         model_path=str(model_path),
@@ -1275,14 +1314,47 @@ def _serve_sglang(
         is_adapter=is_adapter,
         tensor_parallel_size=tensor_parallel,
         mem_fraction_static=gpu_memory_utilization,
+        trust_remote_code=trust_remote_code,
     )
     console.print("[bold green]SGLang runtime ready![/]")
+
+    # Load the tokenizer whose chat template the shared prompt builder applies
+    # (#360). It must match what create_sglang_runtime used to load this very
+    # model a few lines above: a mismatch means a custom-code model loads no
+    # tokenizer, tokenizer becomes None, and the #360 prompt fix silently
+    # degrades to the legacy format for exactly the models whose chat template
+    # matters most. That pairing used to be a literal True on both sides; both
+    # now follow serve.py's single resolved gate instead.
+    tokenizer = _load_serve_tokenizer(
+        model_path=model_path,
+        base_model=base_model,
+        trust_remote_code=trust_remote_code,
+    )
+
+    # A failure here is announced, never silent -- the same three-branch
+    # contract vLLM has at _serve_vllm. Falling back to the legacy
+    # role-prefixed prompt is what made Llama-3.1-8B loop, and on SGLang that
+    # fallback used to happen with nothing printed at all.
+    if tokenizer is None:
+        console.print(
+            "[yellow]Warning:[/] no tokenizer could be loaded for this model — "
+            "falling back to a generic 'User:/Assistant:' prompt. Chat-tuned "
+            "models can run on past their stop token with this format."
+        )
+    elif not getattr(tokenizer, "chat_template", None):
+        console.print(
+            "[yellow]Warning:[/] this model ships no chat template — using the "
+            "generic 'User:/Assistant:' prompt format."
+        )
+    else:
+        console.print("[green]Chat template:[/] applying the model's own template.")
 
     app = create_sglang_app(
         runtime=runtime,
         runtime_model_name=runtime_model_name,
         model_name=str(model_path.name),
         max_tokens_default=max_tokens_default,
+        tokenizer=tokenizer,
     )
 
     return app
@@ -1501,13 +1573,14 @@ def _generate_response(
     """Generate a response from the model."""
     import torch
 
-    from soup_cli.utils.vllm import build_chat_prompt
+    from soup_cli.utils.vllm import encode_chat_prompt
 
     # Apply chat template. #332 — THE shared builder; the vLLM backend calls
-    # the same function so the two backends cannot drift apart again.
-    text = build_chat_prompt(messages, tokenizer)
-
-    inputs = tokenizer(text, return_tensors="pt")
+    # the same function so the two backends cannot drift apart again. #781 —
+    # encoded without re-adding the special tokens the template rendered.
+    inputs = encode_chat_prompt(
+        messages, tokenizer, fallback_on_error=True, return_tensors="pt"
+    )
     input_ids = inputs["input_ids"].to(model.device)
     attention_mask = inputs["attention_mask"].to(model.device)
 
@@ -1594,6 +1667,7 @@ def _create_app(
     web_search_config: Any = None,
     web_search_backend: Any = None,
     auth_token: Optional[str] = None,
+    host: str = "127.0.0.1",
     reasoning_parser: Optional[str] = None,
     record_thumbs_db: Optional[str] = None,
     loaded_bank: Any = None,
@@ -1619,7 +1693,12 @@ def _create_app(
     from pydantic import Field
 
     def _check_tool_auth(authorization: Optional[str]) -> None:
-        """v0.53.7 H-A: gate tool endpoints when ``auth_token`` is set."""
+        """v0.53.7 H-A: gate tool endpoints when host is exposed or auth_token is set."""
+        if host not in {"127.0.0.1", "localhost", "::1"} and not auth_token:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required on non-loopback host",
+            )
         if not auth_token:
             return
         expected = f"Bearer {auth_token}"
@@ -2042,20 +2121,54 @@ def _create_app(
         }
 
     @app.post("/v1/tools/bash")
-    def tool_bash(payload: dict) -> dict:  # noqa: ARG001 — payload unused on stub
-        # v0.53.7 review-fix C1: bash spawns ``/bin/sh -c`` which escapes
-        # the RLVR sandbox's OS-level isolation (``unshare(CLONE_NEWNET)``
-        # / macOS ``sandbox-exec``); a caller can reach
-        # ``http://169.254.169.254/...`` from the child shell. Reverted to
-        # 501 until container/namespace work lands in v0.53.9.
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                "Server-side tool 'bash' live execution deferred to "
-                "v0.53.9 — sandbox isolation requires container/namespace "
-                "work."
-            ),
-        )
+    def tool_bash(
+        payload: dict,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
+        _check_tool_auth(authorization)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid request")
+        command = payload.get("command")
+        if not isinstance(command, str) or not command:
+            raise HTTPException(status_code=400, detail="Invalid request")
+        if len(command) > tool_max_code_len:
+            raise HTTPException(status_code=400, detail="Invalid request")
+        try:
+            from soup_cli.trainer.rewards import _get_isolation_strategy, _run_bash_sandbox
+
+            if _get_isolation_strategy() == "best-effort":
+                raise HTTPException(
+                    status_code=501,
+                    detail="bash sandbox requires OS-level isolation",
+                )
+
+            result = _run_bash_sandbox(command)
+        except (NotImplementedError, PermissionError, subprocess.SubprocessError) as exc:
+            raise HTTPException(
+                status_code=501,
+                detail=str(exc),
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("/v1/tools/bash sandbox error: %s", exc)
+            raise HTTPException(status_code=500, detail="Internal server error")
+        if result.launch_failed:
+            raise HTTPException(
+                status_code=501,
+                detail="bash sandbox failed to initialize OS-level isolation",
+            )
+        exit_code = result.returncode if result.returncode is not None else 1
+        if result.timed_out:
+            exit_code = 124
+        elif result.output_exceeded:
+            exit_code = 1
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": exit_code,
+            "timed_out": result.timed_out,
+        }
 
     @app.post("/v1/tools/web_search")
     def tool_web_search(

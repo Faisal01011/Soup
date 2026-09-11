@@ -15,7 +15,10 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install ruff
-      - run: ruff check src/soup_cli/ scripts/ tests/
+      # benchmarks/harness/ carries real parsing logic — mlx_sft_smoke.py
+      # derives the published throughput figure from mlx-lm's stdout — but was
+      # outside this line until now, so a lint error there could not turn CI red.
+      - run: ruff check src/soup_cli/ scripts/ tests/ benchmarks/
       - name: Lint the workflows themselves
         # `check-yaml` and a YAML parser both accept a workflow GitHub will
         # reject: 195d60b used the `runner` context in a job-level `env:` block,
@@ -23,12 +26,30 @@ jobs:
         # before any job produced a log. actionlint checks context availability,
         # expression syntax, action inputs, and shellchecks `run:` blocks.
         #
-        # Pinned and installed from source rather than `curl | bash` of the
-        # upstream install script, matching how the rest of this repo pulls
-        # third-party tooling. Go is preinstalled on ubuntu-latest.
+        # Installed as the pinned upstream release binary with its published
+        # SHA-256 checked, NOT via `go install`. That is a stronger supply-chain
+        # position than building from source -- the bytes that run are verified
+        # against a hash committed here -- and it removes the failure that took
+        # this job down on 2026-08-31: actionlint v1.7.12 declares
+        # `go >= 1.25.0`, ubuntu-latest ships go 1.24.13, so `go install`
+        # silently switched toolchains and died fetching one:
+        #
+        #   go: switching to go >= 1.25.0: module golang.org/toolchain:
+        #   read ".../@v/list": stream error: INTERNAL_ERROR; received from peer
+        #
+        # A transient network fault in a job that is now a REQUIRED check blocks
+        # every merge in the repository, so this step must not depend on an
+        # implicit toolchain download. `--retry-all-errors` covers the rest.
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          "$(go env GOPATH)/bin/actionlint" -color
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors             --output "${RUNNER_TEMP}/actionlint.tar.gz" "$url"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/actionlint.tar.gz"             | sha256sum --check --strict -
+          tar -xzf "${RUNNER_TEMP}/actionlint.tar.gz" -C "${RUNNER_TEMP}" actionlint
+          "${RUNNER_TEMP}/actionlint" -color
 
   type-check:
     runs-on: ubuntu-latest
@@ -66,8 +87,63 @@ jobs:
           python -c "import importlib.util; names=('torch','trl','datasets','peft','accelerate','bitsandbytes'); present=[name for name in names if importlib.util.find_spec(name)]; assert not present, f'unexpected training dependencies: {present}'"
       - name: Run one-step MLX SFT through the real CLI
         run: pytest -o addopts= -m smoke -k mlx_sft_smoke -q tests/test_smoke_train.py
+  pytorch-smoke:
+    # #596: exercise the real PyTorch SFT + DPO training pipeline on every PR.
+    # Keep this separate from the 3x3 matrix so the expensive model-backed
+    # smoke tests run once, not nine times.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
 
-  # #502/#503/#522/#571: install the exact Torch 2.5.1 / Transformers 5.16.1 /
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set HF cache location
+        run: echo "HF_HOME=$RUNNER_TEMP/hf-cache" >> "$GITHUB_ENV"
+
+      - name: Restore PyTorch smoke HF cache
+        id: hf-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/hf-cache
+          key: hf-pytorch-smoke-${{ runner.os }}-${{ hashFiles('tests/test_smoke_train.py', 'pyproject.toml') }}
+          restore-keys: |
+            hf-pytorch-smoke-${{ runner.os }}-
+
+      - name: Install training dependencies
+        # torch>=2.6 is load-bearing, not belt-and-braces: sshleifer/tiny-gpt2
+        # ships only pytorch_model.bin, and transformers refuses torch.load
+        # below 2.6.0 under CVE-2025-32434. Removing this pin because "[dev]
+        # already pulls torch" breaks the job with a message naming the CVE
+        # rather than the cause.
+        run: pip install -e ".[dev]" "torch>=2.6.0"
+
+      - name: Warm tiny GPT-2 cache
+        shell: python
+        run: |
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              "sshleifer/tiny-gpt2",
+              allow_patterns=["*.json", "*.txt", "*.bin"],
+          )
+
+      - name: Run PyTorch smoke tests
+        run: python -m pytest -o addopts= -m smoke -q tests/
+      - name: Save PyTorch smoke HF cache
+        if: success() && steps.hf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/hf-cache
+          key: hf-pytorch-smoke-${{ runner.os }}-${{ hashFiles('tests/test_smoke_train.py', 'pyproject.toml') }}
+
+  # #502/#503/#522/#571/#651: install the exact Torch 2.6.0 / Transformers 5.16.1 /
   # trl 0.29 / PEFT 0.20 support stack and Plotext 6.0.0 so pip cannot silently
   # upgrade the cell, then assert every pinned compatibility boundary.
   transformers-floor:
@@ -112,6 +188,26 @@ jobs:
               )
               print(f"{name}={got} (matches constraints)")
           PY
+      - name: Prove the pinned torch actually supports trl's FSDP2 path
+        run: |
+          python - <<'PY'
+          import torch
+          import torch.distributed.fsdp as fsdp
+
+          assert hasattr(fsdp, "FSDPModule"), (
+              "torch.distributed.fsdp.FSDPModule is absent — this is the #651 "
+              "root cause; the declared torch floor does not support trl 0.29"
+          )
+          import trl
+          from trl import DPOTrainer, KTOTrainer
+
+          print(
+              "trl",
+              trl.__version__,
+              "imports on torch",
+              torch.__version__,
+          )
+          PY
       - name: Run Transformers floor compatibility guard
         run: >
           pytest -o addopts= --no-cov -q
@@ -119,6 +215,7 @@ jobs:
           tests/test_issue571_qwen4_exp.py
           tests/test_plotext_compat.py
           tests/test_bugfixes.py::TestDiffModelLoading
+          tests/test_issue636_torch_floor.py
 
   test:
     strategy:

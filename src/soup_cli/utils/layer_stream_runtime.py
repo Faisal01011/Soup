@@ -1208,11 +1208,12 @@ def assert_canonical_parameters_intersect(model_a: Any, model_b: Any) -> FrozenS
 # ==========================================================================
 @dataclass(frozen=True)
 class GemmCeiling:
-    """A dense bf16 GEMM rate measured on THIS card, in THIS session."""
+    """A dense GEMM rate measured on THIS card, in THIS session."""
 
     tflops: float
     sm_clock_mhz: Optional[int]
     size: int
+    dtype: str
     samples: tuple[float, ...] = ()
 
 
@@ -1265,7 +1266,7 @@ def measure_gemm_tflops(
     iters: int = _GEMM_ITERS,
     reps: int = _GEMM_REPS,
 ) -> Optional[GemmCeiling]:
-    """Benchmark a dense bf16 matmul to get this card's achievable rate.
+    """Benchmark a dense matmul using this card's resolved stream dtype.
 
     Returns None off CUDA rather than inventing a number — the forecast rests
     entirely on a measurement, so there is nothing honest to return when no
@@ -1282,12 +1283,16 @@ def measure_gemm_tflops(
         import torch
     except ImportError:  # pragma: no cover - torch is a [train] extra
         return None
+    from soup_cli.utils.layer_stream import resolve_stream_dtype
+
     if not torch.cuda.is_available():
         return None
+    dtype_name = resolve_stream_dtype(device)
+    dtype = getattr(torch, dtype_name)
     samples: list[float] = []
     try:
-        left = torch.randn(size, size, device=device, dtype=torch.bfloat16)
-        right = torch.randn(size, size, device=device, dtype=torch.bfloat16)
+        left = torch.randn(size, size, device=device, dtype=dtype)
+        right = torch.randn(size, size, device=device, dtype=dtype)
         for _ in range(max(1, reps)):
             for _ in range(3):  # warm up: the first matmul pays kernel selection
                 left @ right
@@ -1315,6 +1320,7 @@ def measure_gemm_tflops(
         tflops=best,
         sm_clock_mhz=sm_clock_mhz(),
         size=size,
+        dtype=dtype_name,
         samples=tuple(samples),
     )
 
@@ -1354,13 +1360,17 @@ def measure_step_peak_bytes(
     """Run one forward+backward at the configured shape and read the real peak.
 
     This is the #349 instrument. The pre-flight's formula is fitted and, measured
-    here, under-predicts past seq 4096 (0.830x at seq 5120) — a formula cannot
-    model a term nobody has identified, so past that point only a measurement is
-    honest. Synthetic ``input_ids`` are used rather than a real batch because the
-    quantity being bounded is the CONFIGURED shape, which is the worst case any
-    real batch can pad up to; a real batch would measure whatever length it
-    happened to have. Validated against a full ``soup train`` run of the same
-    config: probe 4.3117 GB reserved vs the real run's 4.3159 GB, 0.1% apart.
+    against the real training run, under-predicts past seq 4352 (0.934x the real
+    peak at seq 5120, 0.787x at 6144); against this probe the same formula reads
+    0.992x at seq 4096 and 0.830x at 5120, because the probe runs 12.5-14.3%
+    above the real training step — conservatively high, the direction that makes
+    it safe as a gate. A formula cannot model a term nobody has identified, so
+    past that point only a measurement is honest. Synthetic
+    ``input_ids`` are used rather than a real batch because the quantity being
+    bounded is the CONFIGURED shape, which is the worst case any real batch can
+    pad up to; a real batch would measure whatever length it happened to have.
+    Validated against a full ``soup train`` run of the same config: probe
+    4.3117 GB reserved vs the real run's 4.3159 GB, 0.1% apart.
 
     Costs one step. Measured on an RTX 3050 Laptop: 1.02-1.15 s for
     SmolLM2-135M at 1x1024, 5.09 s at 2x2048, and 5.33 s for Llama-3.1-8B NF4 at
@@ -1862,6 +1872,8 @@ class StreamRuntime:
     #: True source parameter count, from the shard index. PEFT's own total
     #: is ~6.5x too high for a streamed NF4 model (see trainer/sft.py).
     total_params: int = 0
+    #: Read-only Qwen4 PLE mappings, if the N-gram table is SSD-backed.
+    external_sources: Tuple[Any, ...] = ()
 
     def close(self) -> None:
         """Release the weight source and detach the prefetch hook.
@@ -1873,6 +1885,10 @@ class StreamRuntime:
         source_close = getattr(self.source, "close", None)
         if callable(source_close):
             source_close()
+        for external in self.external_sources:
+            external_close = getattr(external, "close", None)
+            if callable(external_close):
+                external_close()
         if self.hook is not None:
             self.hook.remove()
             self.hook = None
@@ -2270,6 +2286,8 @@ def build_streamed_model(
     quant: str = "none",
     double_quant: bool = True,
     tier: str = "ram",
+    weights_dir: Optional[str] = None,
+    ngram_source: str = "disk",
 ) -> Tuple[Any, StreamRuntime]:
     """Meta skeleton -> extras -> LoRA -> streaming. No resident base load."""
     from peft import get_peft_model
@@ -2281,22 +2299,48 @@ def build_streamed_model(
         double_quant=double_quant,
         trust_remote_code=trust_remote_code,
     )
-    extras = materialize_extras(model, shard_dir, index, device=device, dtype=dtype)
-    for param in model.parameters():
-        param.requires_grad = False
-    model = get_peft_model(model, lora_config)
-    materialize_meta_adapters(model, seed=seed, device=device)
-    assert_trainable_adapters_materialized(model)
-    runtime = install_streaming(
-        model,
-        shard_dir=shard_dir,
-        index=index,
-        buffers=buffers,
-        pin=pin,
-        require_pin=require_pin,
-        device=device,
-        console=console,
-        codes=extras.codes,
-        tier=tier,
-    )
+    external_tensors = dict(getattr(index, "external_tensors", None) or {})
+    external_sources: Tuple[Any, ...] = ()
+    if external_tensors:
+        if weights_dir is None:
+            raise ValueError(
+                "a Qwen4 shard index with external PLE tensors requires weights_dir"
+            )
+        from soup_cli.utils.qwen4_ple import install_qwen4_ple_embeddings
+
+        external_sources = install_qwen4_ple_embeddings(
+            model,
+            weights_dir=weights_dir,
+            external_tensors=external_tensors,
+            source=ngram_source,
+        )
+    try:
+        extras = materialize_extras(
+            model, shard_dir, index, device=device, dtype=dtype
+        )
+        for param in model.parameters():
+            param.requires_grad = False
+        from soup_cli.utils.peft_wiring import apply_pre_lora_patches
+
+        apply_pre_lora_patches(model, model_id)
+        model = get_peft_model(model, lora_config)
+        materialize_meta_adapters(model, seed=seed, device=device)
+        assert_trainable_adapters_materialized(model)
+        runtime = install_streaming(
+            model,
+            shard_dir=shard_dir,
+            index=index,
+            buffers=buffers,
+            pin=pin,
+            require_pin=require_pin,
+            device=device,
+            console=console,
+            codes=extras.codes,
+            tier=tier,
+        )
+    except BaseException:
+        for external in external_sources:
+            external.close()
+        raise
+    runtime.external_sources = external_sources
     return model, runtime
